@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 interface BiometricDevice {
@@ -17,6 +17,7 @@ interface AttendanceRecord {
   time: string;
   event: string;
 }
+
 
 // Check if Tauri API is available
 function isTauriAvailable(): boolean {
@@ -43,6 +44,9 @@ async function safeInvoke<T>(cmd: string, args?: any): Promise<T> {
   }
 }
 
+// Pagination constants
+const RECORDS_PER_PAGE = 100;
+
 export default function AttendanceModule() {
   const [devices, setDevices] = useState<BiometricDevice[]>([]);
   const [scanning, setScanning] = useState(false);
@@ -52,7 +56,25 @@ export default function AttendanceModule() {
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadingProgress, setLoadingProgress] = useState<string>("");
   const scanCancelledRef = useRef<boolean>(false);
+  
+  // Pagination state
+  const [currentPage, setCurrentPage] = useState(1);
+  
+  // Manual connection state
+  const [manualIp, setManualIp] = useState<string>("192.168.1.201");
+  const [manualPort, setManualPort] = useState<string>("4370");
+  const [connecting, setConnecting] = useState(false);
+  
+  // Paginated data - only compute what we need to display
+  const paginatedData = useMemo(() => {
+    const startIndex = (currentPage - 1) * RECORDS_PER_PAGE;
+    const endIndex = startIndex + RECORDS_PER_PAGE;
+    return attendanceData.slice(startIndex, endIndex);
+  }, [attendanceData, currentPage]);
+  
+  const totalPages = Math.ceil(attendanceData.length / RECORDS_PER_PAGE);
 
   const scanNetwork = async (): Promise<void> => {
     setScanning(true);
@@ -89,20 +111,88 @@ export default function AttendanceModule() {
     setError(null);
   };
 
+  // Manual connection function (like Python script)
+  const connectManually = async (): Promise<void> => {
+    if (!manualIp.trim()) {
+      setError("Please enter a valid IP address");
+      return;
+    }
+    
+    const port = parseInt(manualPort) || 4370;
+    
+    setConnecting(true);
+    setLoading(true);
+    setError(null);
+    setAttendanceData([]);
+    setCurrentPage(1);
+    setLoadingProgress("Connecting to device...");
+    
+    // Create a virtual device for display
+    const virtualDevice: BiometricDevice = {
+      ip: manualIp.trim(),
+      mac: "Manual Connection",
+      open_ports: [port],
+    };
+    setSelectedDevice(virtualDevice);
+    
+    try {
+      console.log(`🔌 Connecting to ${manualIp}:${port}...`);
+      setLoadingProgress("Fetching attendance data (this may take 30-60 seconds for large datasets)...");
+      
+      const result = await safeInvoke<AttendanceRecord[]>("fetch_attendance", {
+        ip: manualIp.trim(),
+        port: port,
+      });
+      
+      console.log(`✅ Received ${result.length} attendance records`);
+      setLoadingProgress(`Processing ${result.length} records...`);
+      
+      // Small delay to let UI update
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      setAttendanceData(result);
+      setLoadingProgress("");
+      
+      // Add to devices list if not already there
+      if (!devices.some(d => d.ip === manualIp.trim())) {
+        setDevices(prev => [...prev, virtualDevice]);
+      }
+    } catch (err: unknown) {
+      const errorMessage: string = err instanceof Error 
+        ? err.message 
+        : typeof err === 'string' 
+        ? err 
+        : 'Unknown error occurred';
+      setError(errorMessage);
+      console.error("Manual connection error:", err);
+    } finally {
+      setConnecting(false);
+      setLoading(false);
+      setLoadingProgress("");
+    }
+  };
+
   const fetchAttendance = async (device: BiometricDevice): Promise<void> => {
     setLoading(true);
     setError(null);
     setSelectedDevice(device);
+    setCurrentPage(1);
+    setLoadingProgress("Connecting to device...");
     
     const port: number = device.open_ports.includes(4370) 
       ? 4370 
       : device.open_ports[0] ?? 4370;
     
     try {
+      setLoadingProgress("Fetching attendance data (this may take 30-60 seconds for large datasets)...");
       const result = await safeInvoke<AttendanceRecord[]>("fetch_attendance", {
         ip: device.ip,
         port: port,
       });
+      
+      setLoadingProgress(`Processing ${result.length} records...`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
       setAttendanceData(result);
     } catch (err: unknown) {
       const errorMessage: string = err instanceof Error 
@@ -115,6 +205,7 @@ export default function AttendanceModule() {
       setAttendanceData([]);
     } finally {
       setLoading(false);
+      setLoadingProgress("");
     }
   };
 
@@ -156,10 +247,10 @@ export default function AttendanceModule() {
     }
   };
 
-  const exportToCSV = (): void => {
+  const exportAttendanceToCSV = (): void => {
     if (attendanceData.length === 0) return;
 
-    const headers = ["User ID", "User Name", "Date", "Time", "Event", "Status", "Punch"];
+    const headers = ["User ID", "User Name", "Date", "Time", "Event", "Status", "Punch", "Timestamp"];
     const rows = attendanceData.map((record) => [
       record.user_id.toString(),
       record.user_name,
@@ -168,6 +259,7 @@ export default function AttendanceModule() {
       record.event,
       record.status.toString(),
       record.punch.toString(),
+      record.timestamp,
     ]);
 
     const csvContent = [
@@ -175,14 +267,18 @@ export default function AttendanceModule() {
       ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
     ].join("\n");
 
-    const blob = new Blob([csvContent], { type: "text/csv" });
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `attendance_${new Date().toISOString().split("T")[0]}.csv`;
+    a.download = `attendance_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
+  
+  
+  // Legacy export function for backwards compatibility
+  const exportToCSV = exportAttendanceToCSV;
 
   return (
     <div className="h-full flex flex-col">
@@ -194,10 +290,82 @@ export default function AttendanceModule() {
 
       {/* Content */}
       <div className="flex-1 overflow-auto p-6 space-y-6">
+        {/* Manual Connection Section - Primary Method */}
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
+          <div className="flex items-center gap-2 mb-4">
+            <svg className="w-5 h-5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+            </svg>
+            <h3 className="text-lg font-semibold text-gray-800">Direct Connection</h3>
+            <span className="px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 rounded-full">Recommended</span>
+          </div>
+          
+          <p className="text-sm text-gray-600 mb-4">
+            Enter your ZKTeco device IP address and port to connect directly. This is faster and more reliable than network scanning.
+          </p>
+          
+          <div className="flex flex-col md:flex-row gap-4">
+            <div className="flex-1">
+              <label htmlFor="manual-ip" className="block text-sm font-medium text-gray-700 mb-1">
+                Device IP Address
+              </label>
+              <input
+                id="manual-ip"
+                type="text"
+                value={manualIp}
+                onChange={(e) => setManualIp(e.target.value)}
+                placeholder="192.168.1.201"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"
+              />
+            </div>
+            <div className="w-32">
+              <label htmlFor="manual-port" className="block text-sm font-medium text-gray-700 mb-1">
+                Port
+              </label>
+              <input
+                id="manual-port"
+                type="text"
+                value={manualPort}
+                onChange={(e) => setManualPort(e.target.value)}
+                placeholder="4370"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"
+              />
+            </div>
+            <div className="flex items-end">
+              <button
+                onClick={connectManually}
+                disabled={connecting || loading}
+                className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+                type="button"
+              >
+                {connecting ? (
+                  <>
+                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Connecting...
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    </svg>
+                    Connect & Fetch
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+
         {/* Device Scanner Section */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold text-gray-800">Device Scanner</h3>
+            <div className="flex items-center gap-2">
+              <h3 className="text-lg font-semibold text-gray-800">Network Scanner</h3>
+              <span className="px-2 py-0.5 text-xs font-medium bg-gray-100 text-gray-600 rounded-full">Optional</span>
+            </div>
             <div className="flex items-center gap-2">
               {scanning ? (
                 <button
@@ -398,67 +566,174 @@ export default function AttendanceModule() {
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                 </svg>
-                <p className="text-gray-600">Loading attendance data...</p>
+                <p className="text-gray-600 font-medium">Loading attendance data...</p>
+                {loadingProgress && (
+                  <p className="text-sm text-gray-500 mt-2">{loadingProgress}</p>
+                )}
               </div>
             ) : attendanceData.length > 0 ? (
-              <div className="overflow-x-auto">
-                <table className="min-w-full divide-y divide-gray-200">
-                  <thead className="bg-gray-50">
-                    <tr>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        User ID
-                      </th>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        User Name
-                      </th>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Date
-                      </th>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Time
-                      </th>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Event
-                      </th>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Status
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="bg-white divide-y divide-gray-200">
-                    {attendanceData.map((record, idx) => (
-                      <tr key={idx} className="hover:bg-gray-50 transition-colors">
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                          {record.user_id}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                          {record.user_name}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {record.date}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {record.time}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap">
-                          <span className={`px-2 py-1 text-xs font-medium rounded-full ${
-                            record.event === "Check In" 
-                              ? "bg-green-100 text-green-800"
-                              : record.event === "Check Out"
-                              ? "bg-red-100 text-red-800"
-                              : "bg-gray-100 text-gray-800"
-                          }`}>
-                            {record.event}
-                          </span>
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {record.status}
-                        </td>
+              <>
+                {/* Download Buttons Section */}
+                <div className="mb-4 p-4 bg-gray-50 rounded-lg flex flex-wrap gap-3 items-center">
+                  <span className="text-sm font-medium text-gray-700">Download:</span>
+                  <button
+                    onClick={exportAttendanceToCSV}
+                    className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors flex items-center gap-2 text-sm"
+                    type="button"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    Attendance CSV ({attendanceData.length.toLocaleString()} records)
+                  </button>
+                  <span className="text-xs text-gray-500">
+                    Showing {((currentPage - 1) * RECORDS_PER_PAGE) + 1} - {Math.min(currentPage * RECORDS_PER_PAGE, attendanceData.length)} of {attendanceData.length.toLocaleString()}
+                  </span>
+                </div>
+                
+                {/* Pagination Controls - Top */}
+                {totalPages > 1 && (
+                  <div className="mb-4 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setCurrentPage(1)}
+                        disabled={currentPage === 1}
+                        className="px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        First
+                      </button>
+                      <button
+                        onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                        disabled={currentPage === 1}
+                        className="px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        Previous
+                      </button>
+                      <span className="px-3 py-1 text-sm text-gray-700">
+                        Page {currentPage} of {totalPages}
+                      </span>
+                      <button
+                        onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                        disabled={currentPage === totalPages}
+                        className="px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        Next
+                      </button>
+                      <button
+                        onClick={() => setCurrentPage(totalPages)}
+                        disabled={currentPage === totalPages}
+                        className="px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        Last
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-sm text-gray-600">Go to page:</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={totalPages}
+                        value={currentPage}
+                        onChange={(e) => {
+                          const page = parseInt(e.target.value);
+                          if (page >= 1 && page <= totalPages) {
+                            setCurrentPage(page);
+                          }
+                        }}
+                        className="w-20 px-2 py-1 text-sm border border-gray-300 rounded"
+                      />
+                    </div>
+                  </div>
+                )}
+                
+                <div className="overflow-x-auto border border-gray-200 rounded-lg">
+                  <table className="min-w-full divide-y divide-gray-200">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          #
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          User ID
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          User Name
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Date
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Time
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Event
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Status
+                        </th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                      {paginatedData.map((record, idx) => (
+                        <tr key={idx} className="hover:bg-gray-50 transition-colors">
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
+                            {((currentPage - 1) * RECORDS_PER_PAGE) + idx + 1}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                            {record.user_id}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                            {record.user_name}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {record.date}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {record.time}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <span className={`px-2 py-1 text-xs font-medium rounded-full ${
+                              record.event === "Check In" 
+                                ? "bg-green-100 text-green-800"
+                                : record.event === "Check Out"
+                                ? "bg-red-100 text-red-800"
+                                : "bg-gray-100 text-gray-800"
+                            }`}>
+                              {record.event}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {record.status}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                
+                {/* Pagination Controls - Bottom */}
+                {totalPages > 1 && (
+                  <div className="mt-4 flex items-center justify-center gap-2">
+                    <button
+                      onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                      disabled={currentPage === 1}
+                      className="px-4 py-2 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      ← Previous
+                    </button>
+                    <span className="px-4 py-2 text-sm text-gray-600">
+                      Page {currentPage} of {totalPages}
+                    </span>
+                    <button
+                      onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                      disabled={currentPage === totalPages}
+                      className="px-4 py-2 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Next →
+                    </button>
+                  </div>
+                )}
+              </>
             ) : (
               <div className="text-center py-12 text-gray-500">
                 <svg className="w-12 h-12 mx-auto mb-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
