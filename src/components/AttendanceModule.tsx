@@ -10,6 +10,8 @@ interface BiometricDevice {
   ip: string;
   mac: string;
   open_ports: number[];
+  // Custom name set by user (shown as header)
+  custom_name?: string;
   // Device info (populated after first sync)
   device_name?: string;
   firmware_version?: string;
@@ -269,6 +271,8 @@ export default function AttendanceModule() {
   const [error, setError] = useState<string | null>(null);
   const [loadingProgress, setLoadingProgress] = useState<string>("");
   const [manualIp, setManualIp] = useState("");
+  const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
   const scanCancelledRef = useRef<boolean>(false);
   
   // Connected device info
@@ -500,6 +504,37 @@ export default function AttendanceModule() {
       }
       return d.ip !== device.ip;
     }));
+  };
+
+  // Get device ID for editing (serial number or IP)
+  const getDeviceId = (device: BiometricDevice): string => {
+    return device.serial_number || device.ip;
+  };
+
+  // Start editing device name
+  const startEditingName = (device: BiometricDevice, e: React.MouseEvent): void => {
+    e.stopPropagation();
+    setEditingDeviceId(getDeviceId(device));
+    setEditingName(device.custom_name || device.device_name || "");
+  };
+
+  // Save custom name
+  const saveCustomName = (device: BiometricDevice): void => {
+    const trimmedName = editingName.trim();
+    setDevices(prev => prev.map(d => {
+      const isSame = device.serial_number && d.serial_number 
+        ? d.serial_number === device.serial_number 
+        : d.ip === device.ip;
+      return isSame ? { ...d, custom_name: trimmedName || undefined } : d;
+    }));
+    setEditingDeviceId(null);
+    setEditingName("");
+  };
+
+  // Cancel editing
+  const cancelEditing = (): void => {
+    setEditingDeviceId(null);
+    setEditingName("");
   };
   
   // Helper to check if device is selected
@@ -856,7 +891,7 @@ export default function AttendanceModule() {
                     </button>
                     
                     <div className="flex items-start gap-3">
-                      <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${
+                      <div className={`w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0 ${
                         isSelected ? "bg-primary-500 text-white" : "bg-gray-100 text-gray-600"
                       }`}>
                         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -864,10 +899,60 @@ export default function AttendanceModule() {
                         </svg>
                       </div>
                       <div className="flex-1 min-w-0">
-                        {/* Device name as title */}
-                        <p className="font-semibold text-gray-900">
-                          {device.device_name || "Unknown Device"}
-                        </p>
+                        {/* Custom name as header (editable) */}
+                        {editingDeviceId === getDeviceId(device) ? (
+                          <div className="flex items-center gap-1 mb-1" onClick={e => e.stopPropagation()}>
+                            <input
+                              type="text"
+                              value={editingName}
+                              onChange={(e) => setEditingName(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") saveCustomName(device);
+                                if (e.key === "Escape") cancelEditing();
+                              }}
+                              className="flex-1 px-2 py-1 text-sm font-semibold border border-primary-300 rounded focus:outline-none focus:ring-1 focus:ring-primary-500"
+                              placeholder="Enter device name..."
+                              autoFocus
+                            />
+                            <button
+                              onClick={() => saveCustomName(device)}
+                              className="p-1 text-green-600 hover:text-green-700"
+                              title="Save"
+                            >
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                              </svg>
+                            </button>
+                            <button
+                              onClick={cancelEditing}
+                              className="p-1 text-gray-400 hover:text-gray-600"
+                              title="Cancel"
+                            >
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                              </svg>
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-1 group">
+                            <p className="font-semibold text-gray-900 truncate">
+                              {device.custom_name || device.device_name || "Unnamed Device"}
+                            </p>
+                            <button
+                              onClick={(e) => startEditingName(device, e)}
+                              className="p-0.5 text-gray-300 hover:text-primary-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                              title="Edit name"
+                            >
+                              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                              </svg>
+                            </button>
+                          </div>
+                        )}
+                        {/* Device model from device (smaller) */}
+                        {device.device_name && device.custom_name && (
+                          <p className="text-xs text-gray-400">{device.device_name}</p>
+                        )}
                         {/* Serial number as primary ID */}
                         {device.serial_number ? (
                           <p className="text-sm font-mono text-primary-600">{device.serial_number}</p>
