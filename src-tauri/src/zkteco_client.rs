@@ -540,7 +540,7 @@ impl ZKClient {
                 let elapsed = start_time.elapsed().as_secs_f32();
                 let speed = if elapsed > 0.0 { (all_data.len() as f32 / 1024.0) / elapsed } else { 0.0 };
                 debug!("Progress: {}/{} chunks ({:.1} KB/s)", i + 1, packets, speed);
-            }
+        }
         }
         
         if remain > 0 {
@@ -659,7 +659,7 @@ impl ZKClient {
                 self.stream.read_exact(&mut next_tcp_header).map_err(|e| format!("Read header: {}", e))?;
                 let next_tcp_len = u32::from_le_bytes([next_tcp_header[4], next_tcp_header[5], next_tcp_header[6], next_tcp_header[7]]) as usize;
                 if next_tcp_len == 0 { continue; }
-                
+        
                 let mut next_packet = vec![0u8; next_tcp_len];
                 self.stream.read_exact(&mut next_packet).map_err(|e| format!("Read packet: {}", e))?;
                 if next_packet.len() < 8 { continue; }
@@ -713,12 +713,12 @@ impl ZKClient {
             
             let cmd = u16::from_le_bytes([packet[0], packet[1]]);
             self.reply_id = u16::from_le_bytes([packet[6], packet[7]]);
-            
+        
             if cmd == CMD_DATA && packet.len() > 8 {
                 all_data.extend_from_slice(&packet[8..]);
             } else if cmd == CMD_ACK_OK {
                 break;
-            } else {
+        } else {
                 break;
             }
         }
@@ -774,28 +774,37 @@ impl ZKClient {
             while offset + 28 <= userdata.len() {
                 let record = &userdata[offset..offset + 28];
                 let uid = u16::from_le_bytes([record[0], record[1]]) as u32;
-                let name_bytes = &record[8..16];
-                let user_id_num = u32::from_le_bytes([record[24], record[25], record[26], record[27]]);
+                // Name field: bytes 2-10 (8 bytes) or bytes 8-24 (16 bytes) - try larger range
+                let name_bytes = &record[2..26];
                 
-                let name = String::from_utf8_lossy(name_bytes).trim_end_matches('\0').trim().to_string();
-                let name = if name.is_empty() { format!("NN-{}", user_id_num) } else { name };
+                        let name = String::from_utf8_lossy(name_bytes)
+                            .trim_end_matches('\0')
+                    .trim()
+                            .to_string();
+                let name = if name.is_empty() { format!("User-{}", uid) } else { name };
                 
-                users.push(User { uid, user_id: user_id_num.to_string(), name });
+                // For 28-byte records, uid IS the user_id for lookup
+                users.push(User { uid, user_id: uid.to_string(), name });
                 offset += 28;
             }
-        } else {
+                            } else {
+            // 72-byte record format (pyzk)
             let mut offset = 0;
             while offset + 72 <= userdata.len() {
                 let record = &userdata[offset..offset + 72];
                 let uid = u16::from_le_bytes([record[0], record[1]]) as u32;
+                // Name: bytes 11-35 (24 chars)
                 let name_bytes = &record[11..35];
+                // User ID (badge/employee ID): bytes 48-72 (24 chars)
                 let user_id_bytes = &record[48..72];
                 
                 let name = String::from_utf8_lossy(name_bytes).trim_end_matches('\0').trim().to_string();
-                let user_id = String::from_utf8_lossy(user_id_bytes).trim_end_matches('\0').to_string();
+                let badge_id = String::from_utf8_lossy(user_id_bytes).trim_end_matches('\0').trim().to_string();
                 
-                let name = if name.is_empty() { format!("NN-{}", user_id) } else { name };
-                let user_id = if user_id.is_empty() { uid.to_string() } else { user_id };
+                let name = if name.is_empty() { format!("User-{}", uid) } else { name };
+                // Use badge_id as user_id (this is what attendance records use)
+                // If badge_id is empty, fall back to uid
+                let user_id = if badge_id.is_empty() { uid.to_string() } else { badge_id };
                 
                 users.push(User { uid, user_id, name });
                 offset += 72;
@@ -803,6 +812,10 @@ impl ZKClient {
         }
         
         info!("Found {} users", users.len());
+        // Log first few users for debugging
+        for (i, user) in users.iter().take(5).enumerate() {
+            info!("  User {}: uid={}, badge='{}', name='{}'", i+1, user.uid, user.user_id, user.name);
+        }
         Ok(users)
     }
     
@@ -901,15 +914,28 @@ impl ZKClient {
         
         let attendance_data = &data[4..];
         
-        // Build user lookup (by uid and user_id)
+        // Build user lookup (by uid and user_id, with multiple key formats)
         let mut user_lookup: HashMap<String, String> = HashMap::new();
         for user in users {
+            // Add by uid (internal ID)
             user_lookup.insert(user.uid.to_string(), user.name.clone());
+            // Add by user_id string
             user_lookup.insert(user.user_id.clone(), user.name.clone());
+            // Also try parsing user_id as number
+            if let Ok(num) = user.user_id.parse::<u32>() {
+                user_lookup.insert(num.to_string(), user.name.clone());
+            }
+            // Extract leading digits from user_id (e.g., "101Emplo" -> "101")
+            let digits: String = user.user_id.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() && digits != user.user_id {
+                user_lookup.insert(digits, user.name.clone());
+            }
         }
+        info!("User lookup: {} keys for {} users", user_lookup.len(), users.len());
         
         // Parse based on record size
         // pyzk handles: 8, 16, 40 byte records
+        info!("Attendance record size: {} bytes", record_size);
         match record_size {
             8 => {
                 // pyzk: uid, status, timestamp, punch = unpack('HB4sB', ...)
@@ -926,7 +952,7 @@ impl ZKClient {
                     let user_name = user_lookup
                         .get(&user_id_str)
                         .cloned()
-                        .unwrap_or_else(|| format!("Unknown (ID: {})", uid));
+                        .unwrap_or_else(|| format!("ID: {}", uid));
                     
                     let dt = Self::decode_time(timestamp);
                     
@@ -947,6 +973,7 @@ impl ZKClient {
                 // pyzk: user_id, timestamp, status, punch, reserved, workcode = 
                 //       unpack('<I4sBB2sI', ...)
                 let mut offset = 0;
+                let mut sample_logged = false;
                 while offset + 16 <= attendance_data.len() {
                     let record = &attendance_data[offset..offset + 16];
                     
@@ -957,11 +984,17 @@ impl ZKClient {
                     // reserved 2 bytes
                     // workcode 4 bytes
                     
+                    // Log first attendance record for debugging
+                    if !sample_logged {
+                        info!("Sample attendance: user_id={}, bytes={:02X?}", user_id, &record[0..4]);
+                        sample_logged = true;
+                    }
+                    
                     let user_id_str = user_id.to_string();
                     let user_name = user_lookup
                         .get(&user_id_str)
                         .cloned()
-                        .unwrap_or_else(|| format!("Unknown (ID: {})", user_id));
+                        .unwrap_or_else(|| format!("ID: {}", user_id));
                     
                     let dt = Self::decode_time(timestamp);
                     
@@ -983,6 +1016,7 @@ impl ZKClient {
                 //              unpack('<H24sB4sB8s', ...)
                 let actual_record_size = if record_size >= 40 { 40 } else { record_size };
                 let mut offset = 0;
+                let mut sample_logged = false;
                 
                 while offset + actual_record_size <= attendance_data.len() {
                     let record = &attendance_data[offset..offset + actual_record_size];
@@ -996,17 +1030,25 @@ impl ZKClient {
                         
                         let user_id_str = String::from_utf8_lossy(user_id_bytes)
                             .trim_end_matches('\0')
+                            .trim()
                             .to_string();
+                        
+                        // Log first few attendance records for debugging
+                        if !sample_logged && records.len() < 3 {
+                            info!("  Attendance: uid={}, badge='{}', found={}", 
+                                uid, user_id_str, user_lookup.contains_key(&user_id_str));
+                            if records.len() >= 2 { sample_logged = true; }
+                        }
                         
                         let user_name = if !user_id_str.is_empty() {
                             user_lookup.get(&user_id_str)
                                 .or_else(|| user_lookup.get(&uid.to_string()))
                                 .cloned()
-                                .unwrap_or_else(|| format!("Unknown (ID: {})", user_id_str))
+                                .unwrap_or_else(|| format!("ID: {}", user_id_str))
                         } else {
                             user_lookup.get(&uid.to_string())
                             .cloned()
-                                .unwrap_or_else(|| format!("Unknown (UID: {})", uid))
+                                .unwrap_or_else(|| format!("ID: {}", uid))
                         };
                         
                         let dt = Self::decode_time(timestamp);

@@ -2,6 +2,7 @@ import { useState, useRef, useMemo, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 const STORAGE_KEY = "biometric_devices";
+const ATTENDANCE_STORAGE_PREFIX = "attendance_data_";
 
 interface BiometricDevice {
   ip: string;
@@ -33,6 +34,30 @@ function saveDevicesToStorage(devices: BiometricDevice[]): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(devices));
   } catch (e) {
     console.error("Failed to save devices to storage:", e);
+  }
+}
+
+// Load attendance data for a specific device
+function loadAttendanceFromStorage(deviceIp: string): AttendanceRecord[] {
+  try {
+    const key = ATTENDANCE_STORAGE_PREFIX + deviceIp.replace(/\./g, '_');
+    const stored = localStorage.getItem(key);
+    if (stored) {
+      return JSON.parse(stored);
+    }
+  } catch (e) {
+    console.error("Failed to load attendance from storage:", e);
+  }
+  return [];
+}
+
+// Save attendance data for a specific device
+function saveAttendanceToStorage(deviceIp: string, records: AttendanceRecord[]): void {
+  try {
+    const key = ATTENDANCE_STORAGE_PREFIX + deviceIp.replace(/\./g, '_');
+    localStorage.setItem(key, JSON.stringify(records));
+  } catch (e) {
+    console.error("Failed to save attendance to storage:", e);
   }
 }
 
@@ -103,6 +128,18 @@ async function safeInvoke<T>(cmd: string, args?: any): Promise<T> {
 const RECORDS_PER_PAGE = 100;
 
 // Calculate daily summary from raw attendance records
+// Convert time string (HH:MM:SS) to seconds
+function timeToSeconds(time: string): number {
+  const parts = time.split(":");
+  const hours = parseInt(parts[0] || "0");
+  const minutes = parseInt(parts[1] || "0");
+  const seconds = parseInt(parts[2] || "0");
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+// Buffer time in seconds to filter duplicate entries
+const DUPLICATE_BUFFER_SECONDS = 50;
+
 function calculateDailySummary(records: AttendanceRecord[]): DailySummary[] {
   // Group records by user_id + date
   const grouped = new Map<string, AttendanceRecord[]>();
@@ -123,40 +160,84 @@ function calculateDailySummary(records: AttendanceRecord[]): DailySummary[] {
   grouped.forEach((dayRecords) => {
     if (dayRecords.length === 0) return;
     
-    // Sort by time
+    // Sort by time (earliest first)
     dayRecords.sort((a, b) => a.time.localeCompare(b.time));
     
-    const firstRecord = dayRecords[0];
-    const lastRecord = dayRecords[dayRecords.length - 1];
-    
-    // Calculate working hours if there are at least 2 punches
-    let workingHours = "-";
-    if (dayRecords.length >= 2 && firstRecord && lastRecord) {
-      const firstTimeParts = firstRecord.time.split(":");
-      const lastTimeParts = lastRecord.time.split(":");
-      
-      const firstMinutes = parseInt(firstTimeParts[0] || "0") * 60 + parseInt(firstTimeParts[1] || "0");
-      const lastMinutes = parseInt(lastTimeParts[0] || "0") * 60 + parseInt(lastTimeParts[1] || "0");
-      
-      const diffMinutes = lastMinutes - firstMinutes;
-      if (diffMinutes > 0) {
-        const hours = Math.floor(diffMinutes / 60);
-        const mins = diffMinutes % 60;
-        workingHours = `${hours}h ${mins}m`;
+    // Filter out duplicate punches within buffer time
+    const filteredRecords: AttendanceRecord[] = [];
+    for (const record of dayRecords) {
+      const lastFiltered = filteredRecords[filteredRecords.length - 1];
+      if (!lastFiltered) {
+        filteredRecords.push(record);
+      } else {
+        const timeDiff = timeToSeconds(record.time) - timeToSeconds(lastFiltered.time);
+        if (timeDiff > DUPLICATE_BUFFER_SECONDS) {
+          filteredRecords.push(record);
+        }
       }
     }
     
-    if (firstRecord && lastRecord) {
-      summaries.push({
-        user_id: firstRecord.user_id,
-        user_name: firstRecord.user_name,
-        date: firstRecord.date,
-        first_punch: firstRecord.time,
-        last_punch: lastRecord.time,
-        total_punches: dayRecords.length,
-        working_hours: workingHours,
-      });
+    const firstRecord = filteredRecords[0];
+    if (!firstRecord) return;
+    
+    // Calculate working hours using alternating In/Out logic
+    // Punch 1 = In, Punch 2 = Out, Punch 3 = In, Punch 4 = Out, etc.
+    let totalWorkingSeconds = 0;
+    const isCheckedIn = filteredRecords.length % 2 === 1;
+    const isToday = firstRecord.date === new Date().toISOString().split('T')[0];
+    
+    for (let i = 0; i < filteredRecords.length; i += 2) {
+      const checkIn = filteredRecords[i];
+      const checkOut = filteredRecords[i + 1];
+      
+      if (checkIn && checkOut) {
+        // Complete In/Out pair - add working time
+        const inSeconds = timeToSeconds(checkIn.time);
+        const outSeconds = timeToSeconds(checkOut.time);
+        totalWorkingSeconds += (outSeconds - inSeconds);
+      } else if (checkIn && !checkOut && isToday) {
+        // Currently checked in (today only) - add time until now
+        const inSeconds = timeToSeconds(checkIn.time);
+        const now = new Date();
+        const nowSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+        if (nowSeconds > inSeconds) {
+          totalWorkingSeconds += (nowSeconds - inSeconds);
+        }
+      }
     }
+    
+    // Format working hours
+    let workingHours = "-";
+    if (totalWorkingSeconds > 0) {
+      const totalMinutes = Math.floor(totalWorkingSeconds / 60);
+      const hours = Math.floor(totalMinutes / 60);
+      const mins = totalMinutes % 60;
+      workingHours = `${hours}h ${mins}m`;
+      // Add indicator if still checked in today
+      if (isCheckedIn && isToday) {
+        workingHours += " (ongoing)";
+      }
+    }
+    
+    // Determine last checkout time
+    // If even number of punches, last punch is checkout
+    // If odd number and today, show "Now" / otherwise show "-"
+    let lastPunchTime = "-";
+    if (!isCheckedIn) {
+      lastPunchTime = filteredRecords[filteredRecords.length - 1]?.time || "-";
+    } else if (isToday) {
+      lastPunchTime = "Now";
+    }
+    
+    summaries.push({
+      user_id: firstRecord.user_id,
+      user_name: firstRecord.user_name,
+      date: firstRecord.date,
+      first_punch: firstRecord.time,
+      last_punch: lastPunchTime,
+      total_punches: dayRecords.length, // Show actual punch count (including duplicates)
+      working_hours: workingHours,
+    });
   });
   
   // Sort by date (newest first), then by user
@@ -358,8 +439,15 @@ export default function AttendanceModule() {
   // Select a device
   const selectDevice = (device: BiometricDevice): void => {
     setSelectedDevice(device);
-    setAttendanceData([]); // Clear previous data
     setError(null);
+    
+    // Load saved attendance data for this device
+    const savedData = loadAttendanceFromStorage(device.ip);
+    setAttendanceData(savedData);
+    
+    // Reset pagination
+    setCurrentPage(1);
+    setSummaryPage(1);
   };
 
   // Sync (fetch attendance) from selected device
@@ -407,6 +495,9 @@ export default function AttendanceModule() {
       await new Promise(resolve => setTimeout(resolve, 100));
       
       setAttendanceData(result.records);
+      
+      // Save attendance data to localStorage
+      saveAttendanceToStorage(selectedDevice.ip, result.records);
     } catch (err: unknown) {
       const errorMessage: string = err instanceof Error 
         ? err.message 
@@ -423,14 +514,31 @@ export default function AttendanceModule() {
     }
   };
 
-  // Export raw attendance data to CSV
+  // Helper function to download CSV
+  const downloadCSV = (content: string, filename: string): void => {
+    const blob = new Blob(["\uFEFF" + content], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", filename);
+    link.style.visibility = "hidden";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  // Export raw attendance data to CSV (filtered data)
   const exportRawToCSV = (): void => {
-    if (attendanceData.length === 0) return;
+    if (filteredRawData.length === 0) {
+      alert("No data to export");
+      return;
+    }
 
     const headers = ["User ID", "User Name", "Date", "Time", "Status", "Punch", "Timestamp"];
-    const rows = attendanceData.map((record) => [
+    const rows = filteredRawData.map((record) => [
       record.user_id.toString(),
-      record.user_name,
+      record.user_name.replace(/"/g, '""'),
       record.date,
       record.time,
       record.status.toString(),
@@ -443,23 +551,21 @@ export default function AttendanceModule() {
       ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
     ].join("\n");
 
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `attendance_raw_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const filename = `attendance_raw_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
+    downloadCSV(csvContent, filename);
   };
   
-  // Export daily summary to CSV
+  // Export daily summary to CSV (filtered data)
   const exportSummaryToCSV = (): void => {
-    if (dailySummary.length === 0) return;
+    if (filteredSummary.length === 0) {
+      alert("No data to export");
+      return;
+    }
 
     const headers = ["User ID", "User Name", "Date", "Check In", "Check Out", "Total Punches", "Working Hours"];
-    const rows = dailySummary.map((record) => [
+    const rows = filteredSummary.map((record) => [
       record.user_id.toString(),
-      record.user_name,
+      record.user_name.replace(/"/g, '""'),
       record.date,
       record.first_punch,
       record.last_punch,
@@ -472,13 +578,8 @@ export default function AttendanceModule() {
       ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
     ].join("\n");
 
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `attendance_summary_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const filename = `attendance_summary_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
+    downloadCSV(csvContent, filename);
   };
   
 
