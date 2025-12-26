@@ -233,7 +233,7 @@ export default function AttendanceModule() {
     });
   }, [attendanceData, searchQuery, dateFrom, dateTo]);
   
-  // Filter summary data based on search and date
+  // Filter summary data based on search and date (already sorted by date in calculateDailySummary)
   const filteredSummary = useMemo(() => {
     return dailySummary.filter(record => {
       // Search filter (by name or user_id)
