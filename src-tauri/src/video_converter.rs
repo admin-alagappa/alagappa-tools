@@ -15,6 +15,7 @@ pub struct VideoConversionOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ConversionProgress {
     pub percentage: f32,
     pub status: String,

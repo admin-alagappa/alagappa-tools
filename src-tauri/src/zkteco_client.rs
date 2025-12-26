@@ -450,311 +450,180 @@ impl ZKClient {
         let speed = if elapsed > 0.0 { (all_data.len() as f32 / 1024.0) / elapsed } else { 0.0 };
         info!("Downloaded {} bytes in {:.1}s ({:.1} KB/s)", all_data.len(), elapsed, speed);
         
-        Ok((all_data, all_data.len()))
+        let len = all_data.len();
+        Ok((all_data, len))
     }
     
-    /// Read a chunk - matches pyzk's __read_chunk exactly
+    /// Read a single chunk of data
     fn read_chunk_pyzk(&mut self, start: usize, size: usize) -> Result<Vec<u8>, String> {
-        info!("read_chunk_pyzk: reading chunk at start={}, size={}", start, size);
-        
-        // pyzk: command = const._CMD_READ_BUFFER (1504)
-        // pyzk: command_string = pack('<ii', start, size)
         let mut cmd_string = Vec::with_capacity(8);
         cmd_string.extend_from_slice(&(start as i32).to_le_bytes());
         cmd_string.extend_from_slice(&(size as i32).to_le_bytes());
         
-        // pyzk: if self.tcp: response_size = size + 32
-        let _response_size = size + 32;
-        
-        // Send command
         let buf = self.create_header(CMD_DATA_RDY, &cmd_string);
         let top = self.create_tcp_top(&buf);
         
-        info!("read_chunk_pyzk: sending CMD_DATA_RDY (1504)...");
-        self.stream.write_all(&top)
-            .map_err(|e| format!("Send CMD_DATA_RDY failed: {}", e))?;
-        self.stream.flush()
-            .map_err(|e| format!("Flush failed: {}", e))?;
+        self.stream.write_all(&top).map_err(|e| format!("Send failed: {}", e))?;
+        self.stream.flush().map_err(|e| format!("Flush failed: {}", e))?;
         
-        // pyzk: recv(response_size + 8) - but TCP may fragment
-        // Read initial response
-        info!("read_chunk_pyzk: waiting for response...");
         let mut tcp_header = [0u8; 8];
-        self.stream.read_exact(&mut tcp_header)
-            .map_err(|e| format!("Read chunk TCP header: {}", e))?;
-        info!("read_chunk_pyzk: got TCP header");
+        self.stream.read_exact(&mut tcp_header).map_err(|e| format!("Read TCP header: {}", e))?;
         
         let tcp_length = u32::from_le_bytes([tcp_header[4], tcp_header[5], tcp_header[6], tcp_header[7]]) as usize;
-        
         if tcp_length < 8 {
             return Err(format!("TCP length too small: {}", tcp_length));
         }
         
         let mut packet_data = vec![0u8; tcp_length];
-        self.stream.read_exact(&mut packet_data)
-            .map_err(|e| format!("Read chunk packet: {}", e))?;
+        self.stream.read_exact(&mut packet_data).map_err(|e| format!("Read packet: {}", e))?;
         
         let response_cmd = u16::from_le_bytes([packet_data[0], packet_data[1]]);
         self.reply_id = u16::from_le_bytes([packet_data[6], packet_data[7]]);
-        
-        // Data after ZK header (8 bytes)
         let zk_data = if packet_data.len() > 8 { &packet_data[8..] } else { &[] as &[u8] };
         
-        info!("read_chunk_pyzk: cmd={}, tcp_len={}, zk_data_len={}", response_cmd, tcp_length, zk_data.len());
-        
-        // Handle CMD_ACK_OK - this can happen when device is in a different state
-        // or when using draining approach. Try reading data directly from socket.
+        // Handle ACK_OK - read next packet for data
         if response_cmd == CMD_ACK_OK {
-            info!("read_chunk_pyzk: got ACK_OK instead of DATA, trying to read data directly...");
-            
-            // The device might be streaming data differently
-            // Try reading the next packet which might contain actual data
             let mut next_tcp_header = [0u8; 8];
-            match self.stream.read_exact(&mut next_tcp_header) {
-                Ok(_) => {
-                    let next_tcp_len = u32::from_le_bytes([next_tcp_header[4], next_tcp_header[5], 
-                                                          next_tcp_header[6], next_tcp_header[7]]) as usize;
-                    info!("read_chunk_pyzk: next packet tcp_len={}", next_tcp_len);
+            if self.stream.read_exact(&mut next_tcp_header).is_ok() {
+                let next_tcp_len = u32::from_le_bytes([next_tcp_header[4], next_tcp_header[5], next_tcp_header[6], next_tcp_header[7]]) as usize;
+                if next_tcp_len >= 8 {
+                    let mut next_packet = vec![0u8; next_tcp_len];
+                    self.stream.read_exact(&mut next_packet).map_err(|e| format!("Read next packet: {}", e))?;
                     
-                    if next_tcp_len >= 8 {
-                        let mut next_packet = vec![0u8; next_tcp_len];
-                        self.stream.read_exact(&mut next_packet)
-                            .map_err(|e| format!("Read next packet: {}", e))?;
-                        
-                        let next_cmd = u16::from_le_bytes([next_packet[0], next_packet[1]]);
-                        self.reply_id = u16::from_le_bytes([next_packet[6], next_packet[7]]);
-                        
-                        info!("read_chunk_pyzk: next packet cmd={}", next_cmd);
-                        
-                        if next_cmd == CMD_DATA && next_packet.len() > 8 {
-                            let next_data = &next_packet[8..];
-                            let mut result = next_data.to_vec();
-                            
-                            // Read remaining if needed
-                            if result.len() < size {
-                                let need = size - result.len();
-                                let mut more = vec![0u8; need];
-                                self.stream.read_exact(&mut more)
-                                    .map_err(|e| format!("Read remaining after ACK: {}", e))?;
-                                result.extend_from_slice(&more);
-                            }
-                            
-                            return Ok(result[..size.min(result.len())].to_vec());
+                    let next_cmd = u16::from_le_bytes([next_packet[0], next_packet[1]]);
+                    self.reply_id = u16::from_le_bytes([next_packet[6], next_packet[7]]);
+                    
+                    if next_cmd == CMD_DATA && next_packet.len() > 8 {
+                        let mut result = next_packet[8..].to_vec();
+                        if result.len() < size {
+                            let mut more = vec![0u8; size - result.len()];
+                            self.stream.read_exact(&mut more).map_err(|e| format!("Read remaining: {}", e))?;
+                            result.extend_from_slice(&more);
                         }
+                        return Ok(result[..size.min(result.len())].to_vec());
+                    }
+                    
+                    if next_cmd == CMD_PREPARE_DATA {
+                        let inner_size = if next_packet.len() >= 12 {
+                            u32::from_le_bytes([next_packet[8], next_packet[9], next_packet[10], next_packet[11]]) as usize
+                        } else { size };
                         
-                        // Handle PREPARE_DATA followed by DATA stream
-                        if next_cmd == CMD_PREPARE_DATA {
-                            let inner_size = if next_packet.len() >= 12 {
-                                u32::from_le_bytes([next_packet[8], next_packet[9], next_packet[10], next_packet[11]]) as usize
-                            } else {
-                                size
-                            };
-                            info!("read_chunk_pyzk: PREPARE_DATA inner_size={}", inner_size);
+                        let mut all_data = Vec::with_capacity(size);
+                        while all_data.len() < inner_size {
+                            let mut data_tcp_header = [0u8; 8];
+                            self.stream.read_exact(&mut data_tcp_header).map_err(|e| format!("Read DATA header: {}", e))?;
+                            let data_tcp_len = u32::from_le_bytes([data_tcp_header[4], data_tcp_header[5], data_tcp_header[6], data_tcp_header[7]]) as usize;
+                            if data_tcp_len < 8 { break; }
                             
-                            // Read DATA packets until we have enough
-                            let mut all_data = Vec::with_capacity(size);
+                            let mut data_packet = vec![0u8; data_tcp_len];
+                            self.stream.read_exact(&mut data_packet).map_err(|e| format!("Read DATA: {}", e))?;
                             
-                            while all_data.len() < inner_size {
-                                let mut data_tcp_header = [0u8; 8];
-                                self.stream.read_exact(&mut data_tcp_header)
-                                    .map_err(|e| format!("Read DATA TCP header: {}", e))?;
-                                
-                                let data_tcp_len = u32::from_le_bytes([data_tcp_header[4], data_tcp_header[5],
-                                                                        data_tcp_header[6], data_tcp_header[7]]) as usize;
-                                
-                                if data_tcp_len < 8 {
-                                    break;
-                                }
-                                
-                                let mut data_packet = vec![0u8; data_tcp_len];
-                                self.stream.read_exact(&mut data_packet)
-                                    .map_err(|e| format!("Read DATA packet: {}", e))?;
-                                
-                                let data_cmd = u16::from_le_bytes([data_packet[0], data_packet[1]]);
-                                self.reply_id = u16::from_le_bytes([data_packet[6], data_packet[7]]);
-                                
-                                if data_cmd == CMD_DATA && data_packet.len() > 8 {
-                                    all_data.extend_from_slice(&data_packet[8..]);
-                                } else if data_cmd == CMD_ACK_OK {
-                                    break;
-                                } else {
-                                    break;
-                                }
-                            }
+                            let data_cmd = u16::from_le_bytes([data_packet[0], data_packet[1]]);
+                            self.reply_id = u16::from_le_bytes([data_packet[6], data_packet[7]]);
                             
-                            return Ok(all_data[..size.min(all_data.len())].to_vec());
+                            if data_cmd == CMD_DATA && data_packet.len() > 8 {
+                                all_data.extend_from_slice(&data_packet[8..]);
+                            } else { break; }
                         }
+                        return Ok(all_data[..size.min(all_data.len())].to_vec());
                     }
                 }
-                Err(e) => {
-                    info!("read_chunk_pyzk: no data after ACK: {}", e);
-                }
             }
-            
-            // If we couldn't get data after ACK, return empty
             return Ok(Vec::new());
         }
         
         if response_cmd == CMD_DATA {
-            // Direct data response
             let mut result = zk_data.to_vec();
-            
-            // If we need more data, read it directly
             if result.len() < size {
-                let need = size - result.len();
-                let mut more = vec![0u8; need];
-                self.stream.read_exact(&mut more)
-                    .map_err(|e| format!("Read remaining {} bytes: {}", need, e))?;
+                let mut more = vec![0u8; size - result.len()];
+                self.stream.read_exact(&mut more).map_err(|e| format!("Read remaining: {}", e))?;
                 result.extend_from_slice(&more);
             }
-            
-            // Try to read trailing ACK (don't fail if missing)
             let _ = self.try_read_ack();
-            
             return Ok(result[..size.min(result.len())].to_vec());
         }
         
         if response_cmd == CMD_PREPARE_DATA {
-            // pyzk: size = self.__get_data_size() = unpack('I', self.__data[:4])[0]
             if zk_data.len() < 4 {
-                return Err("PREPARE_DATA: no size in response".to_string());
+                return Err("PREPARE_DATA: no size".to_string());
             }
-            
             let inner_size = u32::from_le_bytes([zk_data[0], zk_data[1], zk_data[2], zk_data[3]]) as usize;
-            debug!("read_chunk_pyzk: PREPARE_DATA inner_size={}", inner_size);
-            
-            // pyzk uses __recieve_tcp_data which reads data following PREPARE_DATA
-            // The actual data comes in CMD_DATA packets
             let mut all_data = Vec::with_capacity(inner_size);
             
-            // Read CMD_DATA packets until we have enough
             while all_data.len() < inner_size {
                 let mut next_tcp_header = [0u8; 8];
-                self.stream.read_exact(&mut next_tcp_header)
-                    .map_err(|e| format!("Read data TCP header: {}", e))?;
-                
-                let next_tcp_len = u32::from_le_bytes([next_tcp_header[4], next_tcp_header[5], 
-                                                        next_tcp_header[6], next_tcp_header[7]]) as usize;
-                
-                if next_tcp_len == 0 {
-                    warn!("Got empty TCP packet");
-                    continue;
-                }
+                self.stream.read_exact(&mut next_tcp_header).map_err(|e| format!("Read header: {}", e))?;
+                let next_tcp_len = u32::from_le_bytes([next_tcp_header[4], next_tcp_header[5], next_tcp_header[6], next_tcp_header[7]]) as usize;
+                if next_tcp_len == 0 { continue; }
                 
                 let mut next_packet = vec![0u8; next_tcp_len];
-                self.stream.read_exact(&mut next_packet)
-                    .map_err(|e| format!("Read data packet: {}", e))?;
-                
-                if next_packet.len() < 8 {
-                    warn!("Packet too short: {} bytes", next_packet.len());
-                    continue;
-                }
+                self.stream.read_exact(&mut next_packet).map_err(|e| format!("Read packet: {}", e))?;
+                if next_packet.len() < 8 { continue; }
                 
                 let next_cmd = u16::from_le_bytes([next_packet[0], next_packet[1]]);
                 self.reply_id = u16::from_le_bytes([next_packet[6], next_packet[7]]);
                 
-                if next_cmd == CMD_DATA {
-                    // Append data after ZK header
-                    if next_packet.len() > 8 {
-                        all_data.extend_from_slice(&next_packet[8..]);
-                    }
-                } else if next_cmd == CMD_ACK_OK {
-                    // Done receiving
-                    break;
-                } else {
-                    warn!("Unexpected cmd in data stream: {}", next_cmd);
-                    break;
-                }
+                if next_cmd == CMD_DATA && next_packet.len() > 8 {
+                    all_data.extend_from_slice(&next_packet[8..]);
+                } else if next_cmd == CMD_ACK_OK { break; }
+                else { break; }
             }
-            
-            debug!("read_chunk_pyzk: received {} bytes of {} expected", all_data.len(), inner_size);
             return Ok(all_data[..size.min(all_data.len())].to_vec());
         }
         
-        Err(format!("Unexpected chunk response cmd={}", response_cmd))
+        Err(format!("Unexpected response cmd={}", response_cmd))
     }
     
-    /// Try to read an ACK packet (non-blocking, used after data read)
+    /// Try to read a trailing ACK packet
     fn try_read_ack(&mut self) -> Result<(), String> {
-        // Set short timeout for ACK
         let _ = self.stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
-        
         let mut tcp_header = [0u8; 8];
-        match self.stream.read_exact(&mut tcp_header) {
-            Ok(_) => {
-                let tcp_len = u32::from_le_bytes([tcp_header[4], tcp_header[5], tcp_header[6], tcp_header[7]]) as usize;
-                if tcp_len > 0 && tcp_len <= 64 {
-                    let mut packet = vec![0u8; tcp_len];
-                    let _ = self.stream.read_exact(&mut packet);
-                    if packet.len() >= 8 {
-                        self.reply_id = u16::from_le_bytes([packet[6], packet[7]]);
-                    }
+        if let Ok(_) = self.stream.read_exact(&mut tcp_header) {
+            let tcp_len = u32::from_le_bytes([tcp_header[4], tcp_header[5], tcp_header[6], tcp_header[7]]) as usize;
+            if tcp_len > 0 && tcp_len <= 64 {
+                let mut packet = vec![0u8; tcp_len];
+                let _ = self.stream.read_exact(&mut packet);
+                if packet.len() >= 8 {
+                    self.reply_id = u16::from_le_bytes([packet[6], packet[7]]);
                 }
             }
-            Err(_) => {}
         }
-        
-        // Restore normal timeout
         let _ = self.stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
         Ok(())
     }
     
-    /// Read data stream after CMD_PREPARE_DATA response (pyzk's __recieve_chunk for PREPARE_DATA)
+    /// Read data stream after PREPARE_DATA response
     fn read_prepare_data_stream(&mut self, size: usize) -> Result<(Vec<u8>, usize), String> {
-        info!("read_prepare_data_stream: expecting {} bytes", size);
-        
         let mut all_data = Vec::with_capacity(size);
         let start_time = std::time::Instant::now();
         
-        // Read CMD_DATA packets until we have all data or get ACK_OK
         while all_data.len() < size {
             let mut tcp_header = [0u8; 8];
-            self.stream.read_exact(&mut tcp_header)
-                .map_err(|e| format!("Read data TCP header: {}", e))?;
+            self.stream.read_exact(&mut tcp_header).map_err(|e| format!("Read header: {}", e))?;
             
             let tcp_len = u32::from_le_bytes([tcp_header[4], tcp_header[5], tcp_header[6], tcp_header[7]]) as usize;
-            
-            if tcp_len < 8 {
-                warn!("TCP packet too short: {}", tcp_len);
-                continue;
-            }
+            if tcp_len < 8 { continue; }
             
             let mut packet = vec![0u8; tcp_len];
-            self.stream.read_exact(&mut packet)
-                .map_err(|e| format!("Read data packet: {}", e))?;
+            self.stream.read_exact(&mut packet).map_err(|e| format!("Read packet: {}", e))?;
             
             let cmd = u16::from_le_bytes([packet[0], packet[1]]);
             self.reply_id = u16::from_le_bytes([packet[6], packet[7]]);
             
-            if cmd == CMD_DATA {
-                if packet.len() > 8 {
-                    all_data.extend_from_slice(&packet[8..]);
-                }
-                
-                // Log progress every ~1MB
-                if all_data.len() % (1024 * 1024) < 65536 {
-                    let elapsed = start_time.elapsed().as_secs_f32();
-                    let speed = if elapsed > 0.0 { (all_data.len() as f32 / 1024.0) / elapsed } else { 0.0 };
-                    info!("  📥 {} / {} bytes ({:.1} KB/s)", all_data.len(), size, speed);
-                }
+            if cmd == CMD_DATA && packet.len() > 8 {
+                all_data.extend_from_slice(&packet[8..]);
             } else if cmd == CMD_ACK_OK {
-                info!("read_prepare_data_stream: got ACK_OK, done");
                 break;
-        } else {
-                warn!("read_prepare_data_stream: unexpected cmd={}", cmd);
+            } else {
                 break;
             }
         }
         
-        // Free data buffer
-        let (free_cmd, _) = self.send_command(CMD_FREE_DATA, &[])?;
-        if free_cmd != CMD_ACK_OK {
-            warn!("FREE_DATA returned cmd={}", free_cmd);
-        }
+        let _ = self.send_command(CMD_FREE_DATA, &[]);
         
         let elapsed = start_time.elapsed().as_secs_f32();
         let speed = if elapsed > 0.0 { (all_data.len() as f32 / 1024.0) / elapsed } else { 0.0 };
-        info!("read_prepare_data_stream: received {} bytes in {:.1}s ({:.1} KB/s)", all_data.len(), elapsed, speed);
+        info!("Downloaded {} bytes in {:.1}s ({:.1} KB/s)", all_data.len(), elapsed, speed);
         
         let len = all_data.len();
         Ok((all_data, len))
@@ -780,304 +649,152 @@ impl ZKClient {
     }
     
     fn get_users(&mut self) -> Result<Vec<User>, String> {
-        info!("👥 Fetching users...");
-        
-        // pyzk: userdata, size = self.read_with_buffer(const.CMD_USERTEMP_RRQ, const.FCT_USER)
-        let (data, size) = self.read_with_buffer_pyzk(CMD_USERTEMP_RRQ, FCT_USER)?;
+        let (data, _) = self.read_with_buffer_pyzk(CMD_USERTEMP_RRQ, FCT_USER)?;
         let mut users = Vec::new();
         
-        // Save raw user data to file for debugging
-        if !data.is_empty() {
-            if let Ok(mut file) = std::fs::File::create("/tmp/zk_users_raw.bin") {
-                use std::io::Write;
-                let _ = file.write_all(&data);
-                info!("💾 Saved raw user data to /tmp/zk_users_raw.bin ({} bytes)", data.len());
-            }
-        }
-        
-        info!("👥 User data: {} bytes (size={})", data.len(), size);
-        
         if data.len() <= 4 {
-            info!("👥 No user data received");
             return Ok(users);
         }
         
-        // pyzk: total_size = unpack("I",userdata[:4])[0]
         let total_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        info!("👥 total_size from header: {}", total_size);
-        
-        // pyzk: userdata = userdata[4:] - skip the 4-byte header
         let userdata = &data[4..];
         
-        // pyzk: self.user_packet_size = total_size / self.users
-        // We need to determine record size from data
-        // Try 28 (ZK6) or 72 (ZK8)
         let record_size = if userdata.len() > 0 && total_size > 0 {
-            // Check which record size makes sense
-            if userdata.len() >= 72 && userdata.len() % 72 == 0 {
-                72
-            } else if userdata.len() >= 28 && userdata.len() % 28 == 0 {
-                28
-            } else {
-                // Fallback: estimate from data
-                28
-            }
-        } else {
-            28
-        };
-        
-        info!("👥 Using record size: {} bytes", record_size);
-        
-        let user_count = userdata.len() / record_size;
-        info!("👥 Parsing {} user records", user_count);
+            if userdata.len() >= 72 && userdata.len() % 72 == 0 { 72 }
+            else if userdata.len() >= 28 && userdata.len() % 28 == 0 { 28 }
+            else { 28 }
+        } else { 28 };
         
         if record_size == 28 {
-            // pyzk ZK6: uid, privilege, password, name, card, group_id, timezone, user_id = 
-            //           unpack('<HB5s8sIxBhI', userdata[:28])
-            // H=2, B=1, 5s=5, 8s=8, I=4, x=1, B=1, h=2, I=4 = 28 bytes
             let mut offset = 0;
             while offset + 28 <= userdata.len() {
                 let record = &userdata[offset..offset + 28];
-                
                 let uid = u16::from_le_bytes([record[0], record[1]]) as u32;
-                let _privilege = record[2];
-                let password_bytes = &record[3..8];
                 let name_bytes = &record[8..16];
-                let _card = u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
-                // skip 1 byte (x)
-                let _group_id = record[21];
-                let _timezone = i16::from_le_bytes([record[22], record[23]]);
                 let user_id_num = u32::from_le_bytes([record[24], record[25], record[26], record[27]]);
                 
-                let password = String::from_utf8_lossy(password_bytes)
-                    .trim_end_matches('\0')
-                    .to_string();
-                        let name = String::from_utf8_lossy(name_bytes)
-                            .trim_end_matches('\0')
-                    .trim()
-                            .to_string();
-                        
+                let name = String::from_utf8_lossy(name_bytes).trim_end_matches('\0').trim().to_string();
                 let name = if name.is_empty() { format!("NN-{}", user_id_num) } else { name };
-                        
-                        users.push(User {
-                            uid,
-                    user_id: user_id_num.to_string(),
-                    name,
-                });
                 
+                users.push(User { uid, user_id: user_id_num.to_string(), name });
                 offset += 28;
             }
-                            } else {
-            // pyzk ZK8: uid, privilege, password, name, card, group_id, user_id =
-            //           unpack('<HB8s24sIx7sx24s', userdata[:72])
-            // H=2, B=1, 8s=8, 24s=24, I=4, x=1, 7s=7, x=1, 24s=24 = 72 bytes
+        } else {
             let mut offset = 0;
             while offset + 72 <= userdata.len() {
                 let record = &userdata[offset..offset + 72];
-                
                 let uid = u16::from_le_bytes([record[0], record[1]]) as u32;
-                let _privilege = record[2];
-                let password_bytes = &record[3..11];
                 let name_bytes = &record[11..35];
-                let _card = u32::from_le_bytes([record[35], record[36], record[37], record[38]]);
-                // skip 1 byte
-                let group_id_bytes = &record[40..47];
-                // skip 1 byte  
                 let user_id_bytes = &record[48..72];
                 
-                let _password = String::from_utf8_lossy(password_bytes)
-                    .trim_end_matches('\0')
-                    .to_string();
-                let name = String::from_utf8_lossy(name_bytes)
-                    .trim_end_matches('\0')
-                    .trim()
-                    .to_string();
-                let _group_id = String::from_utf8_lossy(group_id_bytes)
-                    .trim_end_matches('\0')
-                    .to_string();
-                let user_id = String::from_utf8_lossy(user_id_bytes)
-                    .trim_end_matches('\0')
-                    .to_string();
+                let name = String::from_utf8_lossy(name_bytes).trim_end_matches('\0').trim().to_string();
+                let user_id = String::from_utf8_lossy(user_id_bytes).trim_end_matches('\0').to_string();
                 
                 let name = if name.is_empty() { format!("NN-{}", user_id) } else { name };
                 let user_id = if user_id.is_empty() { uid.to_string() } else { user_id };
                 
-                users.push(User {
-                    uid,
-                    user_id,
-                    name,
-                });
-                
+                users.push(User { uid, user_id, name });
                 offset += 72;
             }
         }
         
-        info!("👥 Found {} users", users.len());
+        info!("Found {} users", users.len());
         Ok(users)
     }
     
-    /// Large buffer read - mimics pyzk's recv(1032) behavior
-    /// pyzk reads large buffers which can contain multiple TCP packets
+    /// Large buffer read (captures multiple packets)
     fn send_command_large_recv(&mut self, command: u16, command_string: &[u8]) -> Result<(u16, Vec<u8>), String> {
         let buf = self.create_header(command, command_string);
         let top = self.create_tcp_top(&buf);
         
-        self.stream.write_all(&top)
-            .map_err(|e| format!("Failed to write command: {}", e))?;
-        self.stream.flush()
-            .map_err(|e| format!("Failed to flush: {}", e))?;
+        self.stream.write_all(&top).map_err(|e| format!("Write failed: {}", e))?;
+        self.stream.flush().map_err(|e| format!("Flush failed: {}", e))?;
         
-        // Like pyzk: recv(response_size + 8) where response_size=1024 for buffered reads
-        // This reads UP TO 1032 bytes - may include multiple packets
         let mut large_buf = vec![0u8; 1032];
-        
-        // Set a short timeout for this initial read
         let old_timeout = self.stream.read_timeout().ok().flatten();
         let _ = self.stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
         
-        // Use read() instead of read_exact() to get whatever is available
-        let bytes_read = self.stream.read(&mut large_buf)
-            .map_err(|e| format!("Failed to read large buffer: {}", e))?;
-        
+        let bytes_read = self.stream.read(&mut large_buf).map_err(|e| format!("Read failed: {}", e))?;
         let _ = self.stream.set_read_timeout(old_timeout);
-        
-        info!("send_command_large_recv: read {} bytes", bytes_read);
         
         if bytes_read < 16 {
             return Err(format!("Response too short: {} bytes", bytes_read));
         }
         
-        // Parse first packet's TCP header
         let tcp_magic1 = u16::from_le_bytes([large_buf[0], large_buf[1]]);
         let tcp_magic2 = u16::from_le_bytes([large_buf[2], large_buf[3]]);
-        let tcp_length = u32::from_le_bytes([large_buf[4], large_buf[5], large_buf[6], large_buf[7]]) as usize;
-        
-        info!("send_command_large_recv: tcp_magic=0x{:04X} 0x{:04X}, tcp_len={}", tcp_magic1, tcp_magic2, tcp_length);
         
         if tcp_magic1 != MACHINE_PREPARE_DATA_1 || tcp_magic2 != MACHINE_PREPARE_DATA_2 {
-            return Err(format!("Invalid TCP magic: 0x{:04X} 0x{:04X}", tcp_magic1, tcp_magic2));
+            return Err(format!("Invalid TCP magic"));
         }
         
-        // Parse first packet's ZK header (bytes 8-15)
         let response_cmd = u16::from_le_bytes([large_buf[8], large_buf[9]]);
         let response_session = u16::from_le_bytes([large_buf[12], large_buf[13]]);
         let response_reply_id = u16::from_le_bytes([large_buf[14], large_buf[15]]);
         
-        if response_session != 0 {
-            self.session_id = response_session;
-        }
+        if response_session != 0 { self.session_id = response_session; }
         self.reply_id = response_reply_id;
         
-        info!("  📥 Large recv: cmd={}, session={}, reply={}, total_bytes={}", 
-              response_cmd, response_session, response_reply_id, bytes_read);
-        
-        // Return ALL data after TCP header (like pyzk's __data_recv = __tcp_data_recv[8:])
-        // This includes the ZK header + data of first packet, and potentially more packets
-        let all_data = large_buf[8..bytes_read].to_vec();
-        
-        Ok((response_cmd, all_data))
+        Ok((response_cmd, large_buf[8..bytes_read].to_vec()))
     }
     
-    /// Simple read - send command directly and handle PREPARE_DATA/DATA response
-    /// This is the fallback for devices that don't support buffered reads
+    /// Simple read (direct command)
     fn read_simple(&mut self, command: u16) -> Result<(Vec<u8>, usize), String> {
-        info!("read_simple: sending command {}", command);
-        
-        // Send the command directly (no wrapper)
         let (cmd, data) = self.send_command(command, &[])?;
         
-        info!("read_simple: response cmd={}, data_len={}", cmd, data.len());
-        
-        // If we get CMD_DATA directly, return it
         if cmd == CMD_DATA {
             return Ok((data.clone(), data.len()));
         }
         
-        // If we get CMD_PREPARE_DATA, read the data stream
-        if cmd == CMD_PREPARE_DATA {
-            if data.len() >= 4 {
-                let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                info!("read_simple: PREPARE_DATA size = {} bytes", size);
-                
-                if size > 0 {
-                    return self.read_prepare_data_stream(size);
-                }
+        if cmd == CMD_PREPARE_DATA && data.len() >= 4 {
+            let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if size > 0 {
+                return self.read_prepare_data_stream(size);
             }
-            return Ok((Vec::new(), 0));
         }
         
-        // If we get CMD_ACK_OK with data, return it
         if cmd == CMD_ACK_OK && !data.is_empty() {
             return Ok((data.clone(), data.len()));
         }
         
-        // Empty response
         Ok((Vec::new(), 0))
     }
     
     fn get_attendance(&mut self, users: &[User], expected_records: u32) -> Result<Vec<AttendanceRecord>, String> {
-        info!("🕒 Fetching attendance logs (expecting {} records)...", expected_records);
+        info!("Fetching attendance logs (expecting {})...", expected_records);
         
-        // Try simple read first (direct CMD_ATTLOG_RRQ) - this works on more devices
-        info!("🕒 Trying simple read (CMD_ATTLOG_RRQ directly)...");
-        let (mut data, mut size) = self.read_simple(CMD_ATTLOG_RRQ)?;
+        // Try simple read first
+        let (mut data, _) = self.read_simple(CMD_ATTLOG_RRQ)?;
         
-        // If simple read fails, try buffered read with fct=0
+        // If empty, try buffered read
         if data.len() < 4 && expected_records > 0 {
-            info!("🕒 Simple read empty; trying buffered read with fct=0...");
-            let (data2, size2) = self.read_with_buffer_pyzk(CMD_ATTLOG_RRQ, 0)?;
+            let (data2, _) = self.read_with_buffer_pyzk(CMD_ATTLOG_RRQ, 0)?;
             data = data2;
-            size = size2;
         }
         
-        // If buffered read with fct=0 fails, try fct=1
+        // If still empty, try with fct=1
         if data.len() < 4 && expected_records > 0 {
-            warn!("🕒 Buffered read with fct=0 empty; trying fct=1...");
-            let (data2, size2) = self.read_with_buffer_pyzk(CMD_ATTLOG_RRQ, 1)?;
+            let (data2, _) = self.read_with_buffer_pyzk(CMD_ATTLOG_RRQ, 1)?;
             data = data2;
-            size = size2;
         }
+        
         let mut records = Vec::new();
         
-        // Save raw attendance data to file for debugging
-        if !data.is_empty() {
-            if let Ok(mut file) = std::fs::File::create("/tmp/zk_attendance_raw.bin") {
-                use std::io::Write;
-                let _ = file.write_all(&data);
-                info!("💾 Saved raw attendance data to /tmp/zk_attendance_raw.bin ({} bytes)", data.len());
-            }
-        }
-        
-        info!("🕒 Attendance data: {} bytes (size={})", data.len(), size);
-        
         if data.len() < 4 {
-            info!("🕒 No attendance data received");
             return Ok(records);
         }
         
-        // pyzk: total_size = unpack("I", attendance_data[:4])[0]
         let total_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        info!("🕒 total_size from header: {}", total_size);
         
-        // pyzk: record_size = total_size // self.records
         let record_size = if expected_records > 0 && total_size > 0 {
             total_size / expected_records as usize
         } else {
-            // Fallback: try common sizes
-            if (data.len() - 4) % 40 == 0 {
-                40
-            } else if (data.len() - 4) % 16 == 0 {
-                16
-            } else if (data.len() - 4) % 8 == 0 {
-                8
-            } else {
-                16 // default
-            }
+            if (data.len() - 4) % 40 == 0 { 40 }
+            else if (data.len() - 4) % 16 == 0 { 16 }
+            else if (data.len() - 4) % 8 == 0 { 8 }
+            else { 16 }
         };
         
-        info!("🕒 record_size: {} bytes", record_size);
-        
-        // pyzk: attendance_data = attendance_data[4:] - skip 4-byte header
         let attendance_data = &data[4..];
         
         // Build user lookup (by uid and user_id)
@@ -1214,17 +931,10 @@ impl ZKClient {
             }
         }
         
-        info!("🕒 Parsed {} attendance records", records.len());
-        
-        // Log progress
-        if records.len() > 0 && records.len() % 1000 == 0 {
-            info!("🕒 Processed {} records...", records.len());
-        }
-        
+        info!("Parsed {} attendance records", records.len());
         Ok(records)
     }
     
-    /// Convert status code to event string
     fn status_to_event(status: u8) -> &'static str {
         match status {
             0 => "Check In",
@@ -1240,7 +950,7 @@ impl ZKClient {
     fn disconnect(&mut self) -> Result<(), String> {
         let _ = self.enable_device();
         let _ = self.send_command(CMD_EXIT, &[]);
-        info!("🔌 Disconnected");
+        info!("Disconnected");
         Ok(())
     }
 }
@@ -1252,33 +962,20 @@ pub async fn connect_and_fetch_attendance(
     let ip = ip.to_string();
     
     tokio::task::spawn_blocking(move || {
-        info!("🚀 Starting connection to {}:{}", ip, port);
-        
         let mut client = ZKClient::connect(&ip, port)?;
         
-        // Disable device during data transfer (like pyzk does)
         if let Err(e) = client.disable_device() {
-            warn!("Failed to disable device: {} (continuing anyway)", e);
+            warn!("Failed to disable device: {}", e);
         }
         
-        // Read device sizes first (required before getting attendance)
-        let (user_count, _finger_count, record_count) = client.read_sizes().unwrap_or((0, 0, 0));
+        let (_, _, record_count) = client.read_sizes().unwrap_or((0, 0, 0));
         
-        // Get users first
-        let users = client.get_users().unwrap_or_else(|e| {
-            warn!("Failed to get users: {} (using empty list)", e);
-            Vec::new()
-        });
-        info!("👥 Total users: {} (device reports: {})", users.len(), user_count);
+        let users = client.get_users().unwrap_or_else(|_| Vec::new());
+        info!("Users: {}, Expected records: {}", users.len(), record_count);
         
-        // Get attendance logs
-        if record_count == 0 {
-            info!("🕒 Device reports 0 attendance records");
-        }
         let records = client.get_attendance(&users, record_count)?;
-        info!("🕒 Total attendance logs: {} (device reports: {})", records.len(), record_count);
+        info!("Fetched {} attendance records", records.len());
         
-        // Re-enable device and disconnect
         client.disconnect()?;
         
         Ok(records)

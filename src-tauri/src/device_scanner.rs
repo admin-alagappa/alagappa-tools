@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use std::sync::Arc;
-use log::{info, debug, warn};
+use log::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BiometricDevice {
@@ -15,6 +15,7 @@ pub struct BiometricDevice {
 
 // Common ports for biometric/time-attendance devices
 // Port 4370 is the main ZKTeco protocol port
+#[allow(dead_code)]
 const BIOMETRIC_PORTS: &[u16] = &[4370, 4360];
 const OTHER_PORTS: &[u16] = &[80, 8080];
 
