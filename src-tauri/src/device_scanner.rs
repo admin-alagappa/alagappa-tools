@@ -18,10 +18,10 @@ pub struct BiometricDevice {
 }
 
 // Common ports for biometric/time-attendance devices
-// Port 4370 is the main ZKTeco protocol port
-#[allow(dead_code)]
-const BIOMETRIC_PORTS: &[u16] = &[4370, 4360];
-const OTHER_PORTS: &[u16] = &[80, 8080];
+// ZKTeco protocol ports
+const ZKTECO_PORTS: &[u16] = &[4370, 4360, 5005, 5010, 89];
+// Web/service ports
+const OTHER_PORTS: &[u16] = &[80, 8080, 443, 8443];
 
 // Max concurrent connections for scanning
 const MAX_CONCURRENT: usize = 100;
@@ -61,32 +61,34 @@ async fn check_port(ip: &str, port: u16, timeout_ms: u64) -> bool {
 async fn check_biometric_ip(ip: String, semaphore: Arc<Semaphore>) -> Option<BiometricDevice> {
     let _permit = semaphore.acquire().await.ok()?;
     
-    // First check the main ZKTeco port (4370)
-    let main_port = if check_port(&ip, 4370, 300).await {
-        Some(4370u16)
-    } else if check_port(&ip, 4360, 300).await {
-        Some(4360u16)
-    } else {
-        None
-    };
+    // Check all ZKTeco ports to find the main one
+    let mut main_port: Option<u16> = None;
+    for port in ZKTECO_PORTS {
+        if check_port(&ip, *port, 300).await {
+            main_port = Some(*port);
+            break;
+        }
+    }
     
     if let Some(port) = main_port {
         let mut open_ports = vec![port];
         
-        // Check other ports
+        // Check all other ZKTeco ports
+        for p in ZKTECO_PORTS {
+            if *p != port && check_port(&ip, *p, 200).await {
+                open_ports.push(*p);
+            }
+        }
+        
+        // Check web/service ports
         for p in OTHER_PORTS {
             if check_port(&ip, *p, 200).await {
                 open_ports.push(*p);
             }
         }
         
-        // Check secondary biometric port if not already found
-        if port != 4360 && check_port(&ip, 4360, 200).await {
-            open_ports.push(4360);
-        }
-        if port != 4370 && check_port(&ip, 4370, 200).await {
-            open_ports.push(4370);
-        }
+        // Sort ports for consistent display
+        open_ports.sort();
         
         // Fetch device info
         let device_info = get_device_info_quick(&ip, port).await;
@@ -104,35 +106,60 @@ async fn check_biometric_ip(ip: String, semaphore: Arc<Semaphore>) -> Option<Bio
     None
 }
 
+// Common subnets to scan (in addition to local subnet)
+const COMMON_SUBNETS: &[(u8, u8, u8)] = &[
+    (192, 168, 1),
+    (192, 168, 0),
+    (192, 168, 2),
+    (10, 0, 0),
+    (10, 0, 1),
+    (172, 16, 0),
+];
+
 pub async fn scan_network() -> Result<Vec<BiometricDevice>, String> {
     let local_ip = get_local_ip()?;
-    let network = format!("{}/24", local_ip);
+    let local_parts: Vec<u8> = local_ip.octets().to_vec();
     
-    info!("🔍 Scanning network: {}", network);
+    // Build list of subnets to scan
+    let mut subnets_to_scan: Vec<(u8, u8, u8)> = vec![
+        (local_parts[0], local_parts[1], local_parts[2])
+    ];
     
-    let parts: Vec<u8> = local_ip.octets().to_vec();
+    // Add common subnets if not already included
+    for subnet in COMMON_SUBNETS {
+        if !subnets_to_scan.contains(subnet) {
+            subnets_to_scan.push(*subnet);
+        }
+    }
+    
+    info!("🔍 Scanning {} subnets: local + common", subnets_to_scan.len());
     
     // Create semaphore for concurrent connections
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
     
-    // Spawn tasks for all IPs in parallel
+    // Spawn tasks for all IPs in all subnets
     let mut handles = Vec::new();
     
-    for i in 1..255u8 {
-        let ip = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], i);
-        let sem = Arc::clone(&semaphore);
-        
-        let handle = tokio::spawn(async move {
-            check_biometric_ip(ip, sem).await
-        });
-        handles.push(handle);
+    for (a, b, c) in &subnets_to_scan {
+        for i in 1..255u8 {
+            let ip = format!("{}.{}.{}.{}", a, b, c, i);
+            let sem = Arc::clone(&semaphore);
+            
+            let handle = tokio::spawn(async move {
+                check_biometric_ip(ip, sem).await
+            });
+            handles.push(handle);
+        }
     }
+    
+    info!("🔍 Checking {} IPs...", handles.len());
     
     // Collect results
     let mut biometric_devices = Vec::new();
     
     for handle in handles {
         if let Ok(Some(device)) = handle.await {
+            info!("✅ Found: {}", device.ip);
             biometric_devices.push(device);
         }
     }

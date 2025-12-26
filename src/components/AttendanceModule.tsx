@@ -1,5 +1,7 @@
 import { useState, useRef, useMemo, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
 
 const STORAGE_KEY = "biometric_devices";
 const ATTENDANCE_STORAGE_PREFIX = "attendance_data_";
@@ -38,9 +40,17 @@ function saveDevicesToStorage(devices: BiometricDevice[]): void {
 }
 
 // Load attendance data for a specific device
-function loadAttendanceFromStorage(deviceIp: string): AttendanceRecord[] {
+// Get storage key for device (prefer serial number, fallback to IP)
+function getDeviceStorageKey(device: BiometricDevice): string {
+  if (device.serial_number) {
+    return ATTENDANCE_STORAGE_PREFIX + device.serial_number.replace(/[^a-zA-Z0-9]/g, '_');
+  }
+  return ATTENDANCE_STORAGE_PREFIX + device.ip.replace(/\./g, '_');
+}
+
+function loadAttendanceFromStorage(device: BiometricDevice): AttendanceRecord[] {
   try {
-    const key = ATTENDANCE_STORAGE_PREFIX + deviceIp.replace(/\./g, '_');
+    const key = getDeviceStorageKey(device);
     const stored = localStorage.getItem(key);
     if (stored) {
       return JSON.parse(stored);
@@ -52,9 +62,9 @@ function loadAttendanceFromStorage(deviceIp: string): AttendanceRecord[] {
 }
 
 // Save attendance data for a specific device
-function saveAttendanceToStorage(deviceIp: string, records: AttendanceRecord[]): void {
+function saveAttendanceToStorage(device: BiometricDevice, records: AttendanceRecord[]): void {
   try {
-    const key = ATTENDANCE_STORAGE_PREFIX + deviceIp.replace(/\./g, '_');
+    const key = getDeviceStorageKey(device);
     localStorage.setItem(key, JSON.stringify(records));
   } catch (e) {
     console.error("Failed to save attendance to storage:", e);
@@ -258,6 +268,7 @@ export default function AttendanceModule() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loadingProgress, setLoadingProgress] = useState<string>("");
+  const [manualIp, setManualIp] = useState("");
   const scanCancelledRef = useRef<boolean>(false);
   
   // Connected device info
@@ -379,29 +390,42 @@ export default function AttendanceModule() {
       
       // Only update if scan wasn't cancelled
       if (!scanCancelledRef.current && result.length > 0) {
-        // Merge with existing devices - update existing ones with new info, add new ones
+        // Merge with existing devices - use serial number as unique key (IP can change)
         setDevices(prev => {
-          const existingMap = new Map(prev.map(d => [d.ip, d]));
+          const result_devices = [...prev];
           
-          // Update existing devices with new info from scan
           for (const scanned of result) {
-            const existing = existingMap.get(scanned.ip);
-            if (existing) {
-              // Update with new device info (keep last_synced from existing)
-              existingMap.set(scanned.ip, {
+            // Find by serial number first (if available), then by IP
+            let existingIndex = -1;
+            
+            if (scanned.serial_number) {
+              existingIndex = result_devices.findIndex(d => d.serial_number === scanned.serial_number);
+            }
+            
+            // If not found by serial, try by IP (for devices without serial yet)
+            if (existingIndex === -1) {
+              existingIndex = result_devices.findIndex(d => d.ip === scanned.ip && !d.serial_number);
+            }
+            
+            if (existingIndex !== -1) {
+              // Update existing device (IP might have changed)
+              const existing = result_devices[existingIndex]!;
+              result_devices[existingIndex] = {
                 ...existing,
+                ip: scanned.ip, // Update IP (might have changed)
+                mac: scanned.mac || existing.mac,
                 device_name: scanned.device_name || existing.device_name,
                 firmware_version: scanned.firmware_version || existing.firmware_version,
                 serial_number: scanned.serial_number || existing.serial_number,
                 open_ports: scanned.open_ports,
-              });
+              };
             } else {
               // Add new device
-              existingMap.set(scanned.ip, scanned);
+              result_devices.push(scanned);
             }
           }
           
-          return Array.from(existingMap.values());
+          return result_devices;
         });
       }
     } catch (err: unknown) {
@@ -427,12 +451,58 @@ export default function AttendanceModule() {
     setError(null);
   };
   
+  // Add device manually by IP
+  const addDeviceManually = (): void => {
+    const ip = manualIp.trim();
+    if (!ip) {
+      setError("Please enter an IP address");
+      return;
+    }
+    
+    // Validate IP format
+    const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
+    if (!ipRegex.test(ip)) {
+      setError("Invalid IP address format");
+      return;
+    }
+    
+    // Check if already exists
+    if (devices.some(d => d.ip === ip)) {
+      setError("Device already exists");
+      return;
+    }
+    
+    // Add device with default port
+    const newDevice: BiometricDevice = {
+      ip,
+      mac: "Manual",
+      open_ports: [4370],
+    };
+    
+    setDevices(prev => [...prev, newDevice]);
+    setManualIp("");
+    setError(null);
+  };
+  
   // Remove a device from the list
-  const removeDevice = (ip: string): void => {
-    setDevices(prev => prev.filter(d => d.ip !== ip));
-    if (selectedDevice?.ip === ip) {
-      setSelectedDevice(null);
-      setAttendanceData([]);
+  // Remove device by serial number (or IP if no serial)
+  const removeDevice = (device: BiometricDevice): void => {
+    setDevices(prev => prev.filter(d => {
+      if (device.serial_number && d.serial_number) {
+        return d.serial_number !== device.serial_number;
+      }
+      return d.ip !== device.ip;
+    }));
+    
+    // Clear selection if removed device was selected
+    if (selectedDevice) {
+      const isSame = device.serial_number 
+        ? selectedDevice.serial_number === device.serial_number
+        : selectedDevice.ip === device.ip;
+      if (isSame) {
+        setSelectedDevice(null);
+        setAttendanceData([]);
+      }
     }
   };
   
@@ -442,7 +512,7 @@ export default function AttendanceModule() {
     setError(null);
     
     // Load saved attendance data for this device
-    const savedData = loadAttendanceFromStorage(device.ip);
+    const savedData = loadAttendanceFromStorage(device);
     setAttendanceData(savedData);
     
     // Reset pagination
@@ -496,8 +566,9 @@ export default function AttendanceModule() {
       
       setAttendanceData(result.records);
       
-      // Save attendance data to localStorage
-      saveAttendanceToStorage(selectedDevice.ip, result.records);
+      // Save attendance data to localStorage (use updated device with serial)
+      const updatedDevice = { ...selectedDevice, serial_number: result.device_info.serial_number };
+      saveAttendanceToStorage(updatedDevice, result.records);
     } catch (err: unknown) {
       const errorMessage: string = err instanceof Error 
         ? err.message 
@@ -514,22 +585,27 @@ export default function AttendanceModule() {
     }
   };
 
-  // Helper function to download CSV
-  const downloadCSV = (content: string, filename: string): void => {
-    const blob = new Blob(["\uFEFF" + content], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.setAttribute("href", url);
-    link.setAttribute("download", filename);
-    link.style.visibility = "hidden";
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+  // Helper function to download CSV using Tauri native dialog
+  const downloadCSV = async (content: string, defaultFilename: string): Promise<void> => {
+    try {
+      const filePath = await save({
+        defaultPath: defaultFilename,
+        filters: [{ name: "CSV Files", extensions: ["csv"] }],
+      });
+      
+      if (filePath) {
+        // Add BOM for Excel compatibility
+        await writeTextFile(filePath, "\uFEFF" + content);
+        alert(`File saved: ${filePath}`);
+      }
+    } catch (err) {
+      console.error("Failed to save file:", err);
+      alert("Failed to save file: " + (err instanceof Error ? err.message : String(err)));
+    }
   };
 
   // Export raw attendance data to CSV (filtered data)
-  const exportRawToCSV = (): void => {
+  const exportRawToCSV = async (): Promise<void> => {
     if (filteredRawData.length === 0) {
       alert("No data to export");
       return;
@@ -551,12 +627,12 @@ export default function AttendanceModule() {
       ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
     ].join("\n");
 
-    const filename = `attendance_raw_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
-    downloadCSV(csvContent, filename);
+    const filename = `attendance_raw_${selectedDevice?.serial_number || selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
+    await downloadCSV(csvContent, filename);
   };
   
   // Export daily summary to CSV (filtered data)
-  const exportSummaryToCSV = (): void => {
+  const exportSummaryToCSV = async (): Promise<void> => {
     if (filteredSummary.length === 0) {
       alert("No data to export");
       return;
@@ -578,8 +654,8 @@ export default function AttendanceModule() {
       ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
     ].join("\n");
 
-    const filename = `attendance_summary_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
-    downloadCSV(csvContent, filename);
+    const filename = `attendance_summary_${selectedDevice?.serial_number || selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
+    await downloadCSV(csvContent, filename);
   };
   
 
@@ -640,6 +716,25 @@ export default function AttendanceModule() {
                 </div>
               )}
             </div>
+            
+            {/* Manual IP Add */}
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={manualIp}
+                onChange={(e) => setManualIp(e.target.value)}
+                placeholder="Enter IP (e.g., 192.168.1.201)"
+                className="px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 w-48"
+                onKeyDown={(e) => e.key === 'Enter' && addDeviceManually()}
+              />
+              <button
+                onClick={addDeviceManually}
+                className="px-3 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors text-sm"
+                type="button"
+              >
+                + Add
+              </button>
+            </div>
           </div>
 
           {error && (
@@ -665,10 +760,15 @@ export default function AttendanceModule() {
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {devices.map((device) => {
-                const isSelected = selectedDevice?.ip === device.ip;
+                const deviceKey = device.serial_number || device.ip;
+                const isSelected = selectedDevice 
+                  ? (device.serial_number && selectedDevice.serial_number 
+                      ? device.serial_number === selectedDevice.serial_number 
+                      : device.ip === selectedDevice.ip)
+                  : false;
                 return (
                   <div
-                    key={device.ip}
+                    key={deviceKey}
                     onClick={() => selectDevice(device)}
                     className={`relative p-4 rounded-lg border-2 cursor-pointer transition-all ${
                       isSelected
@@ -680,7 +780,7 @@ export default function AttendanceModule() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        removeDevice(device.ip);
+                        removeDevice(device);
                       }}
                       className="absolute top-2 right-2 p-1 text-gray-400 hover:text-red-500 transition-colors"
                       title="Remove device"
@@ -699,22 +799,22 @@ export default function AttendanceModule() {
                         </svg>
                       </div>
                       <div className="flex-1 min-w-0">
+                        {/* Device name as title */}
                         <p className="font-semibold text-gray-900">
-                          {device.device_name || device.ip}
+                          {device.device_name || "Unknown Device"}
                         </p>
-                        {device.device_name && (
-                          <p className="text-xs text-gray-600">{device.ip}</p>
+                        {/* Serial number as primary ID */}
+                        {device.serial_number ? (
+                          <p className="text-sm font-mono text-primary-600">{device.serial_number}</p>
+                        ) : (
+                          <p className="text-xs text-gray-400 italic">No serial number</p>
                         )}
+                        {/* IP address as secondary info */}
+                        <p className="text-xs text-gray-500">IP: {device.ip}</p>
                         {device.firmware_version && (
-                          <p className="text-xs text-gray-500">FW: {device.firmware_version}</p>
+                          <p className="text-xs text-gray-400">FW: {device.firmware_version}</p>
                         )}
-                        {device.serial_number && (
-                          <p className="text-xs text-gray-500">S/N: {device.serial_number}</p>
-                        )}
-                        {!device.device_name && !device.serial_number && (
-                          <p className="text-xs text-gray-400 italic">Scanning info...</p>
-                        )}
-                        <p className="text-xs text-gray-400 mt-1">Port: {device.open_ports.join(", ")}</p>
+                        <p className="text-xs text-gray-400">Port: {device.open_ports.join(", ")}</p>
                       </div>
                     </div>
                     
@@ -740,7 +840,8 @@ export default function AttendanceModule() {
           {selectedDevice && (
             <div className="mt-4 pt-4 border-t border-gray-200 flex items-center justify-between">
               <div className="text-sm text-gray-600">
-                Selected: <span className="font-medium text-gray-900">{selectedDevice.ip}</span>
+                Selected: <span className="font-medium font-mono text-primary-600">{selectedDevice.serial_number || selectedDevice.ip}</span>
+                {selectedDevice.serial_number && <span className="text-gray-400 ml-2">({selectedDevice.ip})</span>}
               </div>
               <button
                 onClick={syncDevice}
@@ -832,7 +933,7 @@ export default function AttendanceModule() {
                 {selectedDevice && (
                   <div className="text-sm text-gray-600 mt-1 space-y-1">
                     <p>
-                      Device: {selectedDevice.ip} | Raw Records: {attendanceData.length.toLocaleString()} | Daily Summary: {dailySummary.length.toLocaleString()}
+                      Device: <span className="font-mono text-primary-600">{selectedDevice.serial_number || selectedDevice.ip}</span> | Raw Records: {attendanceData.length.toLocaleString()} | Daily Summary: {dailySummary.length.toLocaleString()}
                     </p>
                     {dateRange && (
                       <p className="flex items-center gap-2">
