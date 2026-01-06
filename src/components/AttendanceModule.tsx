@@ -5,6 +5,51 @@ import { writeTextFile } from "@tauri-apps/plugin-fs";
 
 const STORAGE_KEY = "biometric_devices";
 const ATTENDANCE_STORAGE_PREFIX = "attendance_data_";
+const ERP_CONFIG_KEY = "erp_config";
+
+// ERP Types
+interface ErpConfig {
+  api_key: string;
+  api_url?: string;
+}
+
+interface FacultyAttendancePayload {
+  faculty: number;
+  date: string;
+  check_in_time: string | null;
+  check_out_time: string | null;
+  is_present: boolean;
+  notes: string | null;
+}
+
+interface SyncResult {
+  success: boolean;
+  synced_count: number;
+  skipped_count: number;
+  failed_count: number;
+  errors: string[];
+}
+
+// Load ERP config from localStorage (uses login API key)
+function loadErpConfig(): ErpConfig {
+  try {
+    const apiKey = localStorage.getItem("alagappa_api_key") || "";
+    const apiUrl = localStorage.getItem("alagappa_api_url") || undefined;
+    return { api_key: apiKey, api_url: apiUrl };
+  } catch (e) {
+    console.error("Failed to load ERP config:", e);
+  }
+  return { api_key: "" };
+}
+
+// Save ERP config to localStorage
+function saveErpConfig(config: ErpConfig): void {
+  try {
+    localStorage.setItem(ERP_CONFIG_KEY, JSON.stringify(config));
+  } catch (e) {
+    console.error("Failed to save ERP config:", e);
+  }
+}
 
 interface BiometricDevice {
   ip: string;
@@ -280,6 +325,21 @@ export default function AttendanceModule() {
   
   // View state: "raw" or "summary"
   const [viewMode, setViewMode] = useState<"raw" | "summary">("summary");
+
+  // ERP Sync state
+  const [erpConfig, setErpConfig] = useState<ErpConfig>(() => loadErpConfig());
+  const [erpExpanded, setErpExpanded] = useState(false);
+  const [erpTesting, setErpTesting] = useState(false);
+  const [erpSyncing, setErpSyncing] = useState(false);
+  const [erpTestResult, setErpTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [erpSyncResult, setErpSyncResult] = useState<SyncResult | null>(null);
+
+  // Reload ERP config when section is expanded (to pick up changes from login settings)
+  useEffect(() => {
+    if (erpExpanded) {
+      setErpConfig(loadErpConfig());
+    }
+  }, [erpExpanded]);
   
   // Search and filter state
   const [searchQuery, setSearchQuery] = useState("");
@@ -756,12 +816,86 @@ export default function AttendanceModule() {
 
     const firstDevice = selectedDevices[0];
     const deviceLabel = selectedDevices.length === 1 && firstDevice
-      ? (firstDevice.serial_number || firstDevice.ip) 
+      ? (firstDevice.serial_number || firstDevice.ip)
       : selectedDevices.length > 1 ? `${selectedDevices.length}_devices` : 'export';
     const filename = `attendance_summary_${deviceLabel}_${new Date().toISOString().split("T")[0]}.csv`;
     await downloadCSV(csvContent, filename);
   };
-  
+
+  // ERP: Update config and save to localStorage
+  const updateErpConfig = (updates: Partial<ErpConfig>) => {
+    const newConfig = { ...erpConfig, ...updates };
+    setErpConfig(newConfig);
+    saveErpConfig(newConfig);
+    setErpTestResult(null);
+    setErpSyncResult(null);
+  };
+
+  // ERP: Test connection
+  const testErpConnection = async () => {
+    if (!erpConfig.api_key) {
+      setErpTestResult({ success: false, message: "Please enter API Key" });
+      return;
+    }
+
+    setErpTesting(true);
+    setErpTestResult(null);
+
+    try {
+      const result = await safeInvoke<string>("erp_test_connection", {
+        config: erpConfig,
+      });
+      setErpTestResult({ success: true, message: result });
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      setErpTestResult({ success: false, message: errorMessage });
+    } finally {
+      setErpTesting(false);
+    }
+  };
+
+  // ERP: Sync attendance data
+  const syncToErp = async () => {
+    if (!erpConfig.api_key) {
+      setErpSyncResult({ success: false, synced_count: 0, failed_count: 0, errors: ["Please enter API Key first"] });
+      return;
+    }
+
+    if (filteredSummary.length === 0) {
+      setErpSyncResult({ success: false, synced_count: 0, failed_count: 0, errors: ["No attendance data to sync"] });
+      return;
+    }
+
+    setErpSyncing(true);
+    setErpSyncResult(null);
+
+    try {
+      // Transform daily summary to ERP payload format
+      const records: FacultyAttendancePayload[] = filteredSummary.map(summary => ({
+        faculty: summary.user_id,
+        date: summary.date,
+        check_in_time: summary.first_punch !== "-" ? summary.first_punch : null,
+        check_out_time: summary.last_punch !== "-" && summary.last_punch !== "Now" ? summary.last_punch : null,
+        is_present: true,
+        notes: `Synced from biometric device. Punches: ${summary.total_punches}`,
+      }));
+
+      const result = await safeInvoke<SyncResult>("erp_sync_attendance", {
+        request: {
+          config: erpConfig,
+          records: records,
+        },
+      });
+
+      setErpSyncResult(result);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      setErpSyncResult({ success: false, synced_count: 0, failed_count: 0, errors: [errorMessage] });
+    } finally {
+      setErpSyncing(false);
+    }
+  };
+
 
   return (
     <div className="h-full flex flex-col">
@@ -1248,6 +1382,138 @@ export default function AttendanceModule() {
                     </svg>
                     Raw Data CSV
                   </button>
+                </div>
+
+                {/* ERP Sync Section */}
+                <div className="mb-4 border border-purple-200 rounded-lg overflow-hidden">
+                  <button
+                    onClick={() => setErpExpanded(!erpExpanded)}
+                    className="w-full px-4 py-3 bg-gradient-to-r from-purple-50 to-indigo-50 flex items-center justify-between hover:from-purple-100 hover:to-indigo-100 transition-colors"
+                    type="button"
+                  >
+                    <div className="flex items-center gap-2">
+                      <svg className="w-5 h-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+                      </svg>
+                      <span className="font-medium text-purple-800">Sync to ERP</span>
+                      <span className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full">
+                        {(erpConfig.api_url || "https://api.alagappa.org").replace(/^https?:\/\//, '')}
+                      </span>
+                    </div>
+                    <svg
+                      className={`w-5 h-5 text-purple-600 transition-transform ${erpExpanded ? "rotate-180" : ""}`}
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+
+                  {erpExpanded && (
+                    <div className="p-4 bg-white border-t border-purple-100">
+                      {/* ERP Configuration */}
+                      <div className="mb-4">
+                        <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-sm text-blue-700">
+                          <span className="font-medium">Server:</span> {erpConfig.api_url || "https://api.alagappa.org"}
+                          <span className="mx-2">|</span>
+                          <span className="font-medium">Using login API key</span>
+                        </div>
+                      </div>
+
+                      {/* Test Result */}
+                      {erpTestResult && (
+                        <div className={`mb-4 p-3 rounded-lg text-sm ${erpTestResult.success ? "bg-green-50 text-green-700 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
+                          {erpTestResult.success ? "✓ " : "✗ "}{erpTestResult.message}
+                        </div>
+                      )}
+
+                      {/* Sync Result */}
+                      {erpSyncResult && (
+                        <div className={`mb-4 p-3 rounded-lg text-sm ${erpSyncResult.success ? "bg-green-50 border border-green-200" : "bg-yellow-50 border border-yellow-200"}`}>
+                          <div className="flex items-center gap-3 mb-2">
+                            <span className={erpSyncResult.success ? "text-green-700" : "text-yellow-700"}>
+                              {erpSyncResult.success ? "✓ Sync completed" : "⚠ Sync completed with errors"}
+                            </span>
+                          </div>
+                          <div className="flex gap-4 text-xs">
+                            <span className="text-green-600">Synced: {erpSyncResult.synced_count}</span>
+                            {erpSyncResult.skipped_count > 0 && (
+                              <span className="text-yellow-600">Skipped: {erpSyncResult.skipped_count}</span>
+                            )}
+                            {erpSyncResult.failed_count > 0 && (
+                              <span className="text-red-600">Failed: {erpSyncResult.failed_count}</span>
+                            )}
+                          </div>
+                          {erpSyncResult.errors.length > 0 && (
+                            <div className="mt-2 text-xs text-red-600 max-h-24 overflow-y-auto">
+                              {erpSyncResult.errors.slice(0, 5).map((err, i) => (
+                                <div key={i}>{err}</div>
+                              ))}
+                              {erpSyncResult.errors.length > 5 && (
+                                <div className="text-gray-500">... and {erpSyncResult.errors.length - 5} more errors</div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Action Buttons */}
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={testErpConnection}
+                          disabled={erpTesting || !erpConfig.api_key}
+                          className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2 text-sm"
+                          type="button"
+                        >
+                          {erpTesting ? (
+                            <>
+                              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                              </svg>
+                              Testing...
+                            </>
+                          ) : (
+                            <>
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              </svg>
+                              Test Connection
+                            </>
+                          )}
+                        </button>
+
+                        <button
+                          onClick={syncToErp}
+                          disabled={erpSyncing || !erpConfig.api_key || filteredSummary.length === 0}
+                          className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2 text-sm"
+                          type="button"
+                        >
+                          {erpSyncing ? (
+                            <>
+                              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                              </svg>
+                              Syncing...
+                            </>
+                          ) : (
+                            <>
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                              </svg>
+                              Sync {filteredSummary.length} Records to ERP
+                            </>
+                          )}
+                        </button>
+                      </div>
+
+                      <p className="mt-3 text-xs text-gray-500">
+                        Syncs the filtered daily summary data to your ERP system. User IDs are mapped to faculty IDs.
+                      </p>
+                    </div>
+                  )}
                 </div>
                 
                 {/* SUMMARY VIEW */}

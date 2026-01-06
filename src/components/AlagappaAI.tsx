@@ -19,6 +19,22 @@ interface ChatResponse {
   provider: string;
 }
 
+interface BitNetPrerequisites {
+  git: boolean;
+  python: boolean;
+  cmake: boolean;
+  conda: boolean;
+}
+
+interface BitNetSetupStatus {
+  installed: boolean;
+  built: boolean;
+  install_path: string | null;
+  has_models: boolean;
+  models: string[];
+  prerequisites: BitNetPrerequisites;
+}
+
 export default function AlagappaAI() {
   // State
   const [providers, setProviders] = useState<AIProvider[]>([]);
@@ -31,7 +47,15 @@ export default function AlagappaAI() {
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  
+
+  // BitNet setup state
+  const [bitnetStatus, setBitnetStatus] = useState<BitNetSetupStatus | null>(null);
+  const [isInstalling, setIsInstalling] = useState(false);
+  const [isBuilding, setIsBuilding] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [setupMessage, setSetupMessage] = useState<string | null>(null);
+  const [showSetupPanel, setShowSetupPanel] = useState(false);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -71,6 +95,86 @@ export default function AlagappaAI() {
   const saveApiKey = () => {
     localStorage.setItem("openai_api_key", apiKey);
   };
+
+  // BitNet setup functions
+  const loadBitnetStatus = async () => {
+    try {
+      const status = await invoke<BitNetSetupStatus>("bitnet_get_status");
+      setBitnetStatus(status);
+    } catch (err) {
+      console.error("Failed to get BitNet status:", err);
+    }
+  };
+
+  const handleInstallBitnet = async () => {
+    setIsInstalling(true);
+    setSetupMessage(null);
+    try {
+      const result = await invoke<string>("bitnet_install");
+      setSetupMessage(result);
+      await loadBitnetStatus();
+      await loadProviders();
+    } catch (err) {
+      setSetupMessage(`Error: ${err}`);
+    } finally {
+      setIsInstalling(false);
+    }
+  };
+
+  const handleBuildBitnet = async () => {
+    setIsBuilding(true);
+    setSetupMessage("Building BitNet... This may take a few minutes.");
+    try {
+      const result = await invoke<string>("bitnet_build");
+      setSetupMessage(result);
+      await loadBitnetStatus();
+      await loadProviders();
+    } catch (err) {
+      setSetupMessage(`Error: ${err}`);
+    } finally {
+      setIsBuilding(false);
+    }
+  };
+
+  const handleDownloadModel = async (modelName: string) => {
+    setIsDownloading(true);
+    setSetupMessage(null);
+    try {
+      const result = await invoke<string>("bitnet_download_model", { modelName });
+      setSetupMessage(result);
+      await loadBitnetStatus();
+      await loadProviders();
+    } catch (err) {
+      setSetupMessage(`Error: ${err}`);
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
+  const handleUninstallBitnet = async () => {
+    if (!confirm("Are you sure you want to uninstall BitNet? This will remove all models.")) {
+      return;
+    }
+    setIsInstalling(true);
+    setSetupMessage(null);
+    try {
+      const result = await invoke<string>("bitnet_uninstall");
+      setSetupMessage(result);
+      await loadBitnetStatus();
+      await loadProviders();
+    } catch (err) {
+      setSetupMessage(`Error: ${err}`);
+    } finally {
+      setIsInstalling(false);
+    }
+  };
+
+  // Load BitNet status when provider changes to bitnet
+  useEffect(() => {
+    if (selectedProvider === "bitnet") {
+      loadBitnetStatus();
+    }
+  }, [selectedProvider]);
 
   const sendMessage = async () => {
     if (!inputText.trim() || isLoading) return;
@@ -126,7 +230,7 @@ export default function AlagappaAI() {
     setError(null);
   };
 
-  const ollamaAvailable = providers.find(p => p.name === "ollama")?.available && 
+  const ollamaAvailable = providers.find(p => p.name === "ollama")?.available &&
                           (providers.find(p => p.name === "ollama")?.models.length || 0) > 0;
 
   return (
@@ -158,9 +262,10 @@ export default function AlagappaAI() {
               className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg bg-white"
             >
               {providers.map(p => (
-                <option key={p.name} value={p.name} disabled={!p.available}>
-                  {p.name === "ollama" ? "🦙 Ollama" : "🔮 OpenAI"} 
-                  {!p.available && " (not available)"}
+                <option key={p.name} value={p.name} disabled={!p.available && p.name !== "bitnet"}>
+                  {p.name === "ollama" ? "🦙 Ollama" : p.name === "bitnet" ? "⚡ BitNet" : "🔮 OpenAI"}
+                  {!p.available && p.name !== "bitnet" && " (not available)"}
+                  {p.name === "bitnet" && !p.available && " (setup required)"}
                 </option>
               ))}
             </select>
@@ -211,6 +316,72 @@ export default function AlagappaAI() {
             <strong>Ollama not detected.</strong> Install it from{" "}
             <a href="https://ollama.ai" target="_blank" rel="noopener" className="underline">ollama.ai</a>
             {" "}then run: <code className="bg-amber-100 px-1 rounded">ollama pull llama3.2</code>
+          </div>
+        )}
+
+        {/* BitNet Setup Panel - Only show if not fully ready */}
+        {selectedProvider === "bitnet" && bitnetStatus && !(bitnetStatus.installed && bitnetStatus.built && bitnetStatus.models.length > 0) && (
+          <div className="mt-3 p-4 bg-gray-50 border border-gray-200 rounded-lg">
+            <div className="flex items-center justify-between mb-3">
+              <h4 className="text-sm font-semibold text-gray-700">BitNet Setup</h4>
+              {bitnetStatus.installed && (
+                <button
+                  onClick={handleUninstallBitnet}
+                  disabled={isInstalling || isBuilding || isDownloading}
+                  className="px-2 py-1 text-xs text-red-600 hover:text-red-800"
+                >
+                  Uninstall
+                </button>
+              )}
+            </div>
+
+            {/* Step-by-step setup buttons */}
+            <div className="flex flex-wrap gap-2">
+              {/* Step 1: Clone */}
+              <button
+                onClick={handleInstallBitnet}
+                disabled={isInstalling || isBuilding || isDownloading || bitnetStatus.installed}
+                className={`px-3 py-2 text-sm rounded-lg flex items-center gap-2 ${
+                  bitnetStatus.installed
+                    ? "bg-green-100 text-green-700"
+                    : "bg-blue-600 text-white hover:bg-blue-700"
+                } disabled:opacity-50`}
+              >
+                {isInstalling ? "⏳ Cloning..." : bitnetStatus.installed ? "✓ Cloned" : "1. Clone"}
+              </button>
+
+              {/* Step 2: Download Model */}
+              <button
+                onClick={() => handleDownloadModel("BitNet-b1.58-2B-4T")}
+                disabled={isInstalling || isBuilding || isDownloading || !bitnetStatus.installed || bitnetStatus.models.length > 0}
+                className={`px-3 py-2 text-sm rounded-lg flex items-center gap-2 ${
+                  bitnetStatus.models.length > 0
+                    ? "bg-green-100 text-green-700"
+                    : "bg-blue-600 text-white hover:bg-blue-700"
+                } disabled:opacity-50`}
+              >
+                {isDownloading ? "⏳ Downloading..." : bitnetStatus.models.length > 0 ? "✓ Downloaded" : "2. Download Model"}
+              </button>
+
+              {/* Step 3: Build */}
+              <button
+                onClick={handleBuildBitnet}
+                disabled={isInstalling || isBuilding || isDownloading || !bitnetStatus.installed || bitnetStatus.built}
+                className={`px-3 py-2 text-sm rounded-lg flex items-center gap-2 ${
+                  bitnetStatus.built
+                    ? "bg-green-100 text-green-700"
+                    : "bg-blue-600 text-white hover:bg-blue-700"
+                } disabled:opacity-50`}
+              >
+                {isBuilding ? "⏳ Building..." : bitnetStatus.built ? "✓ Built" : "3. Build"}
+              </button>
+            </div>
+
+            {setupMessage && (
+              <div className={`mt-3 p-2 rounded text-xs ${setupMessage.startsWith("Error") ? "bg-red-100 text-red-700" : "bg-green-100 text-green-700"}`}>
+                {setupMessage}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -316,7 +487,7 @@ export default function AlagappaAI() {
           </button>
         </div>
         <div className="mt-2 text-xs text-gray-400 text-center">
-          Using {selectedProvider === "ollama" ? "🦙 Ollama" : "🔮 OpenAI"} • {selectedModel}
+          Using {selectedProvider === "ollama" ? "🦙 Ollama" : selectedProvider === "bitnet" ? "⚡ BitNet" : "🔮 OpenAI"} • {selectedModel}
         </div>
       </div>
     </div>

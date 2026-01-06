@@ -6,6 +6,7 @@ import ImageConverter from "./components/ImageConverter";
 import VideoConverter from "./components/VideoConverter";
 import AlagappaAI from "./components/AlagappaAI";
 import ErrorBoundary from "./components/ErrorBoundary";
+import LoginGate from "./components/LoginGate";
 
 function App() {
   const [activeTool, setActiveTool] = useState<string>("attendance");
@@ -29,9 +30,11 @@ function App() {
 
   return (
     <ErrorBoundary>
-      <Layout activeTool={activeTool} onToolChange={setActiveTool}>
-        {renderTool()}
-      </Layout>
+      <LoginGate>
+        <Layout activeTool={activeTool} onToolChange={setActiveTool}>
+          {renderTool()}
+        </Layout>
+      </LoginGate>
     </ErrorBoundary>
   );
 }

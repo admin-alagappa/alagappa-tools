@@ -5,6 +5,7 @@ mod media_converter;
 mod document_converter;
 mod bundled_converter;
 mod ai_assistant;
+mod erp_sync;
 
 use device_scanner::{scan_network, BiometricDevice};
 use zkteco_client::{connect_and_fetch_attendance, AttendanceResponse};
@@ -12,7 +13,8 @@ use media_converter::{
     VideoConvertOptions, ImageConvertOptions, ConversionResult, MediaInfo,
 };
 use document_converter::ToolStatus;
-use ai_assistant::{AIProvider, ChatRequest, ChatResponse};
+use ai_assistant::{AIProvider, ChatRequest, ChatResponse, BitNetSetupStatus};
+use erp_sync::{ErpConfig, AttendanceSyncRequest, SyncResult, ApiKeyInfo};
 
 // ============================================================================
 // Attendance Commands
@@ -211,6 +213,63 @@ fn ai_get_system_prompt() -> String {
 }
 
 // ============================================================================
+// BitNet Setup Commands
+// ============================================================================
+
+#[tauri::command]
+fn bitnet_get_status() -> BitNetSetupStatus {
+    ai_assistant::get_bitnet_status()
+}
+
+#[tauri::command]
+async fn bitnet_install() -> Result<String, String> {
+    ai_assistant::install_bitnet().await
+}
+
+#[tauri::command]
+async fn bitnet_build() -> Result<String, String> {
+    ai_assistant::build_bitnet().await
+}
+
+#[tauri::command]
+async fn bitnet_download_model(model_name: String) -> Result<String, String> {
+    ai_assistant::download_bitnet_model(model_name).await
+}
+
+#[tauri::command]
+async fn bitnet_uninstall() -> Result<String, String> {
+    ai_assistant::uninstall_bitnet().await
+}
+
+// ============================================================================
+// ERP Sync Commands
+// ============================================================================
+
+#[tauri::command]
+async fn erp_sync_attendance(request: AttendanceSyncRequest) -> Result<SyncResult, String> {
+    erp_sync::sync_attendance_to_erp(request).await
+}
+
+#[tauri::command]
+async fn erp_test_connection(config: ErpConfig) -> Result<String, String> {
+    erp_sync::test_erp_connection(config).await
+}
+
+// ============================================================================
+// Authentication Commands
+// ============================================================================
+
+#[tauri::command]
+async fn verify_api_key(api_key: String, api_url: Option<String>) -> Result<ApiKeyInfo, String> {
+    erp_sync::verify_api_key(&api_key, api_url.as_deref()).await
+}
+
+#[tauri::command]
+fn get_default_api_url() -> String {
+    erp_sync::DEFAULT_API_URL.to_string()
+}
+
+// ============================================================================
 // App Entry Point
 // ============================================================================
 
@@ -257,6 +316,18 @@ pub fn run() {
             ai_get_providers,
             ai_chat,
             ai_get_system_prompt,
+            // BitNet Setup
+            bitnet_get_status,
+            bitnet_install,
+            bitnet_build,
+            bitnet_download_model,
+            bitnet_uninstall,
+            // ERP Sync
+            erp_sync_attendance,
+            erp_test_connection,
+            // Authentication
+            verify_api_key,
+            get_default_api_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
