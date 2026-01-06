@@ -2,10 +2,10 @@ import { useState, useRef, useMemo, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { useAuth } from "./LoginGate";
 
 const STORAGE_KEY = "biometric_devices";
 const ATTENDANCE_STORAGE_PREFIX = "attendance_data_";
-const ERP_CONFIG_KEY = "erp_config";
 
 // ERP Types
 interface ErpConfig {
@@ -42,14 +42,6 @@ function loadErpConfig(): ErpConfig {
   return { api_key: "" };
 }
 
-// Save ERP config to localStorage
-function saveErpConfig(config: ErpConfig): void {
-  try {
-    localStorage.setItem(ERP_CONFIG_KEY, JSON.stringify(config));
-  } catch (e) {
-    console.error("Failed to save ERP config:", e);
-  }
-}
 
 interface BiometricDevice {
   ip: string;
@@ -308,6 +300,7 @@ function calculateDailySummary(records: AttendanceRecord[]): DailySummary[] {
 }
 
 export default function AttendanceModule() {
+  const { logout } = useAuth();
   const [devices, setDevices] = useState<BiometricDevice[]>(() => loadDevicesFromStorage());
   const [scanning, setScanning] = useState(false);
   const [selectedDevices, setSelectedDevices] = useState<BiometricDevice[]>([]);
@@ -822,15 +815,6 @@ export default function AttendanceModule() {
     await downloadCSV(csvContent, filename);
   };
 
-  // ERP: Update config and save to localStorage
-  const updateErpConfig = (updates: Partial<ErpConfig>) => {
-    const newConfig = { ...erpConfig, ...updates };
-    setErpConfig(newConfig);
-    saveErpConfig(newConfig);
-    setErpTestResult(null);
-    setErpSyncResult(null);
-  };
-
   // ERP: Test connection
   const testErpConnection = async () => {
     if (!erpConfig.api_key) {
@@ -848,6 +832,11 @@ export default function AttendanceModule() {
       setErpTestResult({ success: true, message: result });
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      // Check for AUTH_ERROR - API key revoked or invalid
+      if (errorMessage.startsWith("AUTH_ERROR:")) {
+        logout();
+        return;
+      }
       setErpTestResult({ success: false, message: errorMessage });
     } finally {
       setErpTesting(false);
@@ -857,12 +846,12 @@ export default function AttendanceModule() {
   // ERP: Sync attendance data
   const syncToErp = async () => {
     if (!erpConfig.api_key) {
-      setErpSyncResult({ success: false, synced_count: 0, failed_count: 0, errors: ["Please enter API Key first"] });
+      setErpSyncResult({ success: false, synced_count: 0, skipped_count: 0, failed_count: 0, errors: ["Please enter API Key first"] });
       return;
     }
 
     if (filteredSummary.length === 0) {
-      setErpSyncResult({ success: false, synced_count: 0, failed_count: 0, errors: ["No attendance data to sync"] });
+      setErpSyncResult({ success: false, synced_count: 0, skipped_count: 0, failed_count: 0, errors: ["No attendance data to sync"] });
       return;
     }
 
@@ -890,7 +879,12 @@ export default function AttendanceModule() {
       setErpSyncResult(result);
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      setErpSyncResult({ success: false, synced_count: 0, failed_count: 0, errors: [errorMessage] });
+      // Check for AUTH_ERROR - API key revoked or invalid
+      if (errorMessage.startsWith("AUTH_ERROR:")) {
+        logout();
+        return;
+      }
+      setErpSyncResult({ success: false, synced_count: 0, skipped_count: 0, failed_count: 0, errors: [errorMessage] });
     } finally {
       setErpSyncing(false);
     }

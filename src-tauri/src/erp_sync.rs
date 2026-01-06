@@ -79,7 +79,13 @@ pub async fn sync_attendance_to_erp(request: AttendanceSyncRequest) -> Result<Sy
     } else {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        Err(format!("API Error ({}): {}", status, error_text))
+
+        // Return special error for unauthorized - frontend will handle logout
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            Err(format!("AUTH_ERROR: {}", error_text))
+        } else {
+            Err(format!("API Error ({}): {}", status, error_text))
+        }
     }
 }
 

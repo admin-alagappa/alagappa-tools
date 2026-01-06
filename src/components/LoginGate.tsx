@@ -36,11 +36,10 @@ export default function LoginGate({ children }: LoginGateProps) {
   const [apiUrl, setApiUrl] = useState(() => localStorage.getItem(API_URL_STORAGE) || DEFAULT_API_URL);
   const [tempApiUrl, setTempApiUrl] = useState(apiUrl);
 
-  // Load and verify stored API key on mount
+  // Load and verify stored API key on mount - ALWAYS validate, no cache fallback
   useEffect(() => {
     const verifyStoredKey = async () => {
       const storedKey = localStorage.getItem(API_KEY_STORAGE);
-      const storedInfo = localStorage.getItem(APP_INFO_STORAGE);
       const storedUrl = localStorage.getItem(API_URL_STORAGE);
 
       if (storedUrl) {
@@ -80,21 +79,11 @@ export default function LoginGate({ children }: LoginGateProps) {
           setError("Your API key is no longer valid. Please enter a new one.");
         }
       } catch (err) {
-        // Network error or server issue - try using cached info
-        if (storedInfo) {
-          try {
-            const cachedInfo = JSON.parse(storedInfo);
-            setAppInfo(cachedInfo);
-            setIsAuthenticated(true);
-          } catch {
-            localStorage.removeItem(API_KEY_STORAGE);
-            localStorage.removeItem(APP_INFO_STORAGE);
-            setError("Failed to verify API key. Please try again.");
-          }
-        } else {
-          const errorMessage = err instanceof Error ? err.message : String(err);
-          setError(`Failed to connect to server: ${errorMessage}`);
-        }
+        // Network error or server issue - DO NOT use cache, require re-login
+        localStorage.removeItem(API_KEY_STORAGE);
+        localStorage.removeItem(APP_INFO_STORAGE);
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        setError(`Failed to verify API key: ${errorMessage}`);
       } finally {
         setIsLoading(false);
       }

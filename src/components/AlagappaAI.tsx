@@ -54,7 +54,6 @@ export default function AlagappaAI() {
   const [isBuilding, setIsBuilding] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [setupMessage, setSetupMessage] = useState<string | null>(null);
-  const [showSetupPanel, setShowSetupPanel] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
